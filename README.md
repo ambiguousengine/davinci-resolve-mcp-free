@@ -27,22 +27,37 @@ DaVinci Resolve API
 
 ## Features
 
-### 51 MCP Tools
+### 162 MCP Tools
 
-**Read (9 tools):** project info, current page, timeline details, clip lists, markers, render settings, media pool contents, render formats
+**Read (31 endpoints):** project info, current page, timeline details, clip lists, markers, render settings & resolutions, media pool contents & folder structure, clip metadata & properties, per-clip markers & flags, node graph & LUT info, color versions, color groups, Fusion compositions, takes, linked items, voice isolation state, Fairlight presets, current video item, clip thumbnail, gallery albums & stills, keyframe mode, project list, database list, media storage, quick export presets
 
-**Write (33 tools):**
+**Write (124 endpoints):**
 - **Navigation** — switch pages, move playhead
 - **Markers** — add/delete timeline markers
-- **Timeline** — create, rename, duplicate, switch timelines
+- **Per-Clip Markers & Flags** — add/get/delete markers on individual clips, add/get/clear flags
+- **Timeline** — create, rename, duplicate, switch, export (AAF/EDL/FCPXML/OTIO), set/clear mark in/out
+- **Timeline Clip Manipulation** — delete clips (with ripple), link/unlink clips, create compound clips, create Fusion clips
 - **Tracks** — add, delete, enable/disable, lock/unlock, rename
-- **Media** — import files, append clips to timeline
-- **Clips** — set color, enable/disable, transform properties (pan, tilt, zoom, rotation, opacity, crop, composite mode)
+- **Media Pool Deep Access** — navigate folders, create subfolders, get/set clip metadata & properties, move/delete/relink/unlink clips, auto-sync audio, import timelines from file, export metadata to CSV, replace clips
+- **Media** — import files, import from storage, append/insert clips to timeline
+- **Media Storage** — browse volumes, list files/folders, reveal in storage panel
+- **Clips** — set color, enable/disable, transform properties, render cache, update sidecar (BRAW/R3D)
+- **Color Grading** — set/get LUT on nodes, enable/disable nodes, apply grade from DRX, set CDL values, export LUT, copy grades between clips, reset grades, reset node colors, ARRI CDL/LUT
+- **Color Versions** — add, load, delete, rename local/remote versions
+- **Color Groups** — create, delete, assign clips to groups, remove from groups
+- **Fusion Compositions** — list, add, import, export, delete, load, rename per-clip Fusion comps
+- **Smart Features (Studio)** — Magic Mask (create/regenerate), Stabilize, Smart Reframe
+- **Audio/Fairlight** — apply Fairlight presets, insert audio at playhead, get/set voice isolation state (per-track and per-clip)
+- **Take Selector** — add takes, select, delete, finalize
+- **Proxy Management** — link/unlink proxy media, replace clip source
 - **Titles & Generators** — insert Text+, generators, Fusion compositions
-- **Rendering** — configure settings, set format/codec, manage render queue, start/stop renders
+- **Rendering** — configure settings, set format/codec, manage render queue, start/stop, job status, render mode, quick export, render presets, LUT refresh, render resolutions
+- **Gallery & Stills** — list/create albums, grab stills (single or all clips), export/import/delete stills, set labels
 - **Project** — save, export current frame, modify project/timeline settings, auto-subtitles, scene detection
+- **Project Manager** — list/load/create/delete projects, archive/export/import projects, navigate project folders, switch databases
+- **Presets** — layout presets (save/load/export/import), render presets, burn-in presets, keyframe mode
 
-**AI Tools (9 tools) — open-source replacements for Studio features:**
+**AI Tools (7 tools) — open-source replacements for Studio features:**
 
 | Studio Feature | Open-Source Replacement | MCP Tools |
 |---|---|---|
@@ -145,12 +160,12 @@ Once the bridge is running, you can ask your AI assistant things like:
 
 ## Architecture
 
-The bridge exposes a clean HTTP API:
+The bridge exposes a clean HTTP API (31 GET + 124 POST = 155 endpoints):
 
 | Method | Endpoints | Purpose |
 |--------|-----------|---------|
-| `GET`  | `/status`, `/project`, `/page`, `/timeline`, `/timeline/clips`, `/timeline/markers`, `/render`, `/mediapool` | Read-only queries |
-| `POST` | `/page`, `/playhead`, `/marker/*`, `/timeline/*`, `/track/*`, `/media/*`, `/clip/*`, `/title/*`, `/generator/*`, `/fusion/*`, `/render/*`, `/project/*` | Write/mutation operations |
+| `GET`  | `/status`, `/project`, `/page`, `/timeline`, `/timeline/clips`, `/timeline/markers`, `/timeline/current-item`, `/timeline/thumbnail`, `/render`, `/mediapool`, `/mediapool/structure`, `/mediapool/clip/metadata`, `/mediapool/clip/info`, `/clip/markers`, `/clip/flags`, `/gallery/albums`, `/gallery/stills` | Read-only queries |
+| `POST` | `/page`, `/playhead`, `/marker/*`, `/timeline/*`, `/track/*`, `/media/*`, `/mediapool/*`, `/clip/*`, `/title/*`, `/generator/*`, `/fusion/*`, `/render/*`, `/project/*`, `/gallery/*` | Write/mutation operations |
 
 All responses are JSON. The MCP server translates between MCP tool calls and these HTTP endpoints.
 
@@ -182,13 +197,27 @@ Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTransla
 - **Models:** `tiny`, `base`, `small` (default), `medium`, `large-v3`
 - **First run:** Downloads the model (~483MB for `small`)
 
+## Free vs Studio Compatibility
+
+**155 of 162 tools work on DaVinci Resolve Free.** The remaining 7 require Studio (DaVinci Neural Engine). For each Studio-only feature, a local open-source AI alternative is provided that works on Free.
+
+| Feature | Studio Tool | Free Alternative (Local AI) |
+|---|---|---|
+| Voice Isolation | `get_voice_isolation_state`, `set_voice_isolation_state` | `voice_isolate`, `voice_isolate_timeline` (Demucs v4) |
+| Magic Mask / BG Removal | `create_magic_mask`, `regenerate_magic_mask` | `remove_background`, `remove_background_video`, `remove_background_clip` (rembg/BiRefNet) |
+| Speech-to-Text | `create_subtitles_from_audio` | `transcribe_timeline`, `transcribe_file` (faster-whisper) |
+| Smart Reframe | `smart_reframe_clip` | — |
+| Stabilization | `stabilize_clip` | — |
+
+All tool docstrings are tagged: `[STUDIO ONLY]` for Studio-required tools, `[FREE + STUDIO · LOCAL AI]` for local AI alternatives.
+
 ## Limitations
 
 - **Keyframe animations** cannot be set via the scripting API — only static property values
-- **Fusion node parameters** (text content, effects) require manual editing in the Fusion page
+- **Fusion node parameters** inside compositions (text content, effect values) require the Fusion page UI
 - **Transitions** must be added manually from the Effects Library
-- **Color grading** adjustments are not exposed through the scripting API
-- **Video background removal** is CPU-bound and can be slow for long clips — consider processing short segments
+- **Video background removal** (local AI) is CPU-bound and can be slow for long clips — consider processing short segments
+- **Gallery stills** require being on the Color page for grab operations
 
 ## License
 
