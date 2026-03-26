@@ -544,6 +544,373 @@ def detect_scene_cuts() -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# AI: VOICE ISOLATION (local Demucs — replaces Studio Voice Isolation)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_demucs_model = None
+_demucs_model_name = None
+
+
+def _load_demucs(model_name: str = "htdemucs"):
+    global _demucs_model, _demucs_model_name
+    if _demucs_model and _demucs_model_name == model_name:
+        return _demucs_model
+    try:
+        from demucs.pretrained import get_model
+    except ImportError:
+        return None
+    logger.info("Loading Demucs model '%s' (first load downloads ~80MB)...", model_name)
+    _demucs_model = get_model(model_name)
+    _demucs_model.eval()
+    _demucs_model_name = model_name
+    logger.info("Demucs model '%s' loaded.", model_name)
+    return _demucs_model
+
+
+def _run_voice_isolation(
+    file_path: str,
+    model_name: str = "htdemucs",
+    two_stems: str = "vocals",
+    output_dir: str = "",
+) -> Dict[str, Any]:
+    try:
+        import torch
+        import numpy as np
+        import soundfile as sf
+        from demucs.apply import apply_model
+    except ImportError as e:
+        return {"error": f"Missing dependency: {e}. Run: pip install demucs soundfile"}
+
+    if not os.path.isfile(file_path):
+        return {"error": f"File not found: {file_path}"}
+
+    model = _load_demucs(model_name)
+    if model is None:
+        return {"error": "demucs is not installed. Run: pip install demucs"}
+
+    if not output_dir:
+        output_dir = os.path.join(os.path.dirname(file_path), "davinci-mcp-output", "voice-isolation")
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger.info("Voice isolation starting: %s (model=%s, stems=%s)", file_path, model_name, two_stems)
+
+    try:
+        wav_np, sr = sf.read(file_path, dtype="float32")
+        if wav_np.ndim == 1:
+            wav_np = np.stack([wav_np, wav_np], axis=-1)
+
+        wav_tensor = torch.from_numpy(wav_np.T).float()
+
+        target_sr = model.samplerate
+        if sr != target_sr:
+            import torchaudio.functional as F
+            wav_tensor = F.resample(wav_tensor, sr, target_sr)
+
+        ref = wav_tensor.mean(0)
+        wav_tensor = (wav_tensor - ref.mean()) / ref.std()
+        sources = apply_model(model, wav_tensor[None], device="cpu")[0]
+        sources = sources * ref.std() + ref.mean()
+
+        stem_idx = model.sources.index(two_stems) if two_stems in model.sources else 0
+        stem_audio = sources[stem_idx].detach().cpu().numpy()
+
+        other_indices = [i for i in range(len(model.sources)) if i != stem_idx]
+        nostem_audio = sources[other_indices].sum(0).detach().cpu().numpy()
+
+        basename = os.path.splitext(os.path.basename(file_path))[0]
+        stem_dir = os.path.join(output_dir, basename)
+        os.makedirs(stem_dir, exist_ok=True)
+
+        stem_path = os.path.join(stem_dir, f"{two_stems}.wav")
+        nostem_path = os.path.join(stem_dir, f"no_{two_stems}.wav")
+
+        sf.write(stem_path, stem_audio.T, target_sr)
+        sf.write(nostem_path, nostem_audio.T, target_sr)
+
+        logger.info("Voice isolation complete: %s, %s", stem_path, nostem_path)
+        return {
+            "success": True,
+            "model": model_name,
+            "stems": {two_stems: stem_path, f"no_{two_stems}": nostem_path},
+            "output_dir": stem_dir,
+        }
+    except Exception as e:
+        logger.exception("Voice isolation failed")
+        return {"error": f"Demucs separation failed: {e}"}
+
+
+@mcp.tool()
+def voice_isolate(
+    file_path: str,
+    model: str = "htdemucs",
+    stems: str = "vocals",
+    output_dir: str = "",
+) -> Dict[str, Any]:
+    """Separate vocals from background audio using Demucs (replaces Studio Voice Isolation).
+    Downloads the model on first use (~150MB). Runs on CPU (~1.5x real-time).
+    Args:
+        file_path: Absolute path to audio/video file.
+        model: Demucs model — 'htdemucs' (default, best quality), 'htdemucs_ft' (slower, slightly better),
+               'mdx_extra' (good alternative). First run downloads the model.
+        stems: Which stem to isolate — 'vocals' (default, outputs vocals + no_vocals),
+               'drums', or 'bass'.
+        output_dir: Optional output directory. Defaults to a folder next to the source file.
+    Returns paths to the separated audio stems (e.g. vocals.wav, no_vocals.wav)."""
+    return _run_voice_isolation(file_path, model, stems, output_dir)
+
+
+@mcp.tool()
+def voice_isolate_timeline(
+    model: str = "htdemucs",
+    stems: str = "vocals",
+    output_dir: str = "",
+) -> Dict[str, Any]:
+    """Isolate vocals from the current timeline's audio track using Demucs.
+    Automatically detects the audio file from audio track 1.
+    Args:
+        model: Demucs model — 'htdemucs' (default), 'htdemucs_ft', 'mdx_extra'.
+        stems: Which stem to isolate — 'vocals' (default), 'drums', 'bass'.
+        output_dir: Optional output directory.
+    Returns paths to the separated audio stems."""
+    clips = _get("/timeline/clips", {"track_type": "audio", "track_index": "1"})
+    if "error" in clips:
+        return clips
+    clip_list = clips.get("clips", [])
+    if not clip_list:
+        return {"error": "No audio clips found on audio track 1"}
+    file_path = clip_list[0].get("File Path", "")
+    if not file_path:
+        return {"error": "Could not determine audio file path from the timeline clip"}
+    return _run_voice_isolation(file_path, model, stems, output_dir)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AI: BACKGROUND REMOVAL (local rembg — replaces Studio Magic Mask)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_rembg_session = None
+_rembg_model_name = None
+
+
+def _load_rembg(model_name: str = "birefnet-general"):
+    global _rembg_session, _rembg_model_name
+    if _rembg_session and _rembg_model_name == model_name:
+        return _rembg_session
+    try:
+        from rembg import new_session
+    except ImportError:
+        return None
+    logger.info("Loading rembg model '%s' (first load downloads the model)...", model_name)
+    _rembg_session = new_session(model_name)
+    _rembg_model_name = model_name
+    logger.info("rembg model '%s' loaded.", model_name)
+    return _rembg_session
+
+
+def _remove_bg_single(input_path: str, output_path: str, model_name: str, alpha_matte: bool) -> bool:
+    session = _load_rembg(model_name)
+    if session is None:
+        return False
+    from rembg import remove
+    from PIL import Image
+
+    img = Image.open(input_path)
+    result = remove(img, session=session, alpha_matting=alpha_matte)
+    result.save(output_path)
+    return True
+
+
+@mcp.tool()
+def remove_background(
+    file_path: str,
+    model: str = "birefnet-general",
+    output_path: str = "",
+    alpha_matting: bool = False,
+) -> Dict[str, Any]:
+    """Remove background from a single image (replaces Studio Magic Mask for stills).
+    Downloads the model on first use (~170MB). Runs on CPU.
+    Args:
+        file_path: Absolute path to the image file.
+        model: Segmentation model — 'birefnet-general' (default, best quality),
+               'birefnet-general-lite' (faster), 'u2net' (classic), 'u2net_human_seg' (people only),
+               'isnet-general-use', 'silueta' (smallest).
+        output_path: Where to save the result. Defaults to <input>_nobg.png.
+        alpha_matting: If True, applies alpha matting for smoother edges (slower).
+    Returns the path to the output image with transparent background."""
+    try:
+        from rembg import remove
+        from PIL import Image
+    except ImportError:
+        return {"error": "rembg is not installed. Run: pip install 'rembg[cpu]'"}
+
+    if not os.path.isfile(file_path):
+        return {"error": f"File not found: {file_path}"}
+
+    if not output_path:
+        base, _ = os.path.splitext(file_path)
+        output_path = f"{base}_nobg.png"
+
+    session = _load_rembg(model)
+    if session is None:
+        return {"error": "Failed to load rembg model"}
+
+    logger.info("Removing background: %s", file_path)
+    try:
+        img = Image.open(file_path)
+        result = remove(img, session=session, alpha_matting=alpha_matting)
+        result.save(output_path)
+        logger.info("Background removed: %s", output_path)
+        return {"success": True, "output_path": output_path}
+    except Exception as e:
+        return {"error": f"Background removal failed: {e}"}
+
+
+@mcp.tool()
+def remove_background_video(
+    file_path: str,
+    model: str = "birefnet-general",
+    output_dir: str = "",
+    output_format: str = "png_sequence",
+    alpha_matting: bool = False,
+) -> Dict[str, Any]:
+    """Remove background from every frame of a video file (replaces Studio Magic Mask for video).
+    Extracts frames with ffmpeg, processes each with AI, reassembles the result.
+    Args:
+        file_path: Absolute path to the video file.
+        model: Segmentation model — 'birefnet-general' (default), 'birefnet-general-lite' (faster),
+               'u2net', 'u2net_human_seg'.
+        output_dir: Where to save output frames. Defaults to a folder next to the source file.
+        output_format: 'png_sequence' (default, PNG frames with alpha) or 'matte_video'
+                       (grayscale matte as MP4, white=foreground).
+        alpha_matting: If True, applies alpha matting per frame (slower, smoother edges).
+    Returns the output directory path and frame count. Processing is ~0.5-2s per frame on CPU."""
+    try:
+        from rembg import remove
+        from PIL import Image
+    except ImportError:
+        return {"error": "rembg is not installed. Run: pip install 'rembg[cpu]'"}
+
+    if not os.path.isfile(file_path):
+        return {"error": f"File not found: {file_path}"}
+
+    import subprocess
+    import shutil
+
+    basename = os.path.splitext(os.path.basename(file_path))[0]
+    if not output_dir:
+        output_dir = os.path.join(os.path.dirname(file_path), "davinci-mcp-output", "background-removal", basename)
+    os.makedirs(output_dir, exist_ok=True)
+
+    frames_dir = os.path.join(output_dir, "_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    logger.info("Extracting frames from: %s", file_path)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", file_path, "-qscale:v", "2", os.path.join(frames_dir, "frame_%06d.png")],
+            capture_output=True, text=True, check=True,
+        )
+    except FileNotFoundError:
+        return {"error": "ffmpeg not found. Install ffmpeg to process video files."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"ffmpeg frame extraction failed: {e.stderr[:500]}"}
+
+    frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith(".png"))
+    if not frame_files:
+        return {"error": "No frames extracted from video"}
+
+    total = len(frame_files)
+    logger.info("Processing %d frames with model '%s'...", total, model)
+
+    session = _load_rembg(model)
+    if session is None:
+        return {"error": "Failed to load rembg model"}
+
+    output_frames_dir = os.path.join(output_dir, "frames")
+    os.makedirs(output_frames_dir, exist_ok=True)
+
+    for i, fname in enumerate(frame_files):
+        if (i + 1) % 50 == 0 or i == 0:
+            logger.info("  Frame %d / %d", i + 1, total)
+        try:
+            img = Image.open(os.path.join(frames_dir, fname))
+            result = remove(img, session=session, alpha_matting=alpha_matting)
+
+            if output_format == "matte_video":
+                alpha = result.split()[-1] if result.mode == "RGBA" else result.convert("L")
+                alpha.save(os.path.join(output_frames_dir, fname))
+            else:
+                result.save(os.path.join(output_frames_dir, fname))
+        except Exception as e:
+            logger.warning("  Frame %d failed: %s", i + 1, e)
+
+    shutil.rmtree(frames_dir, ignore_errors=True)
+
+    response: Dict[str, Any] = {
+        "success": True,
+        "model": model,
+        "total_frames": total,
+        "output_dir": output_frames_dir,
+        "output_format": output_format,
+    }
+
+    if output_format == "matte_video":
+        matte_path = os.path.join(output_dir, f"{basename}_matte.mp4")
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", file_path],
+                capture_output=True, text=True,
+            )
+            fps = probe.stdout.strip() or "30"
+
+            subprocess.run(
+                ["ffmpeg", "-y", "-framerate", fps,
+                 "-i", os.path.join(output_frames_dir, "frame_%06d.png"),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", matte_path],
+                capture_output=True, text=True, check=True,
+            )
+            response["matte_video"] = matte_path
+        except Exception as e:
+            logger.warning("Matte video assembly failed: %s", e)
+            response["matte_video_error"] = str(e)
+
+    logger.info("Background removal complete: %d frames processed", total)
+    return response
+
+
+@mcp.tool()
+def remove_background_clip(
+    track_type: str = "video",
+    track_index: int = 1,
+    clip_index: int = 0,
+    model: str = "birefnet-general",
+    output_format: str = "png_sequence",
+) -> Dict[str, Any]:
+    """Remove background from a specific timeline clip's source video.
+    Finds the clip's source file from the timeline, processes it, returns output paths.
+    Args:
+        track_type: 'video' or 'audio'. Defaults to 'video'.
+        track_index: 1-based track index. Defaults to 1.
+        clip_index: 0-based clip position on the track. Defaults to 0.
+        model: Segmentation model — 'birefnet-general' (default), 'birefnet-general-lite' (faster).
+        output_format: 'png_sequence' (PNG with alpha) or 'matte_video' (B/W matte MP4).
+    Returns the output directory and frame count."""
+    clips = _get("/timeline/clips", {"track_type": track_type, "track_index": str(track_index)})
+    if "error" in clips:
+        return clips
+    clip_list = clips.get("clips", [])
+    if not clip_list:
+        return {"error": f"No clips on {track_type} track {track_index}"}
+    if clip_index < 0 or clip_index >= len(clip_list):
+        return {"error": f"clip_index {clip_index} out of range (0-{len(clip_list) - 1})"}
+    file_path = clip_list[clip_index].get("File Path", "")
+    if not file_path:
+        return {"error": "Could not determine file path for this clip"}
+    return remove_background_video(file_path, model=model, output_format=output_format)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # TRANSCRIPTION (local Whisper via faster-whisper)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -638,5 +1005,5 @@ def transcribe_file(file_path: str, model_size: str = "small", language: str = "
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting DaVinci Resolve MCP Bridge Server (read + write + transcription)")
+    logger.info("Starting DaVinci Resolve MCP Bridge Server (read + write + AI tools)")
     mcp.run()

@@ -2,7 +2,7 @@
 
 Control DaVinci Resolve from AI coding assistants like Cursor using the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-This bridge gives your AI assistant **full read and write access** to DaVinci Resolve — query timelines, manipulate clips, add markers, insert titles, control rendering, and even transcribe audio using local Whisper models. It works with **DaVinci Resolve Free** (no Studio license required).
+This bridge gives your AI assistant **full read and write access** to DaVinci Resolve — query timelines, manipulate clips, add markers, insert titles, control rendering, transcribe audio, isolate vocals, and remove video backgrounds. All AI features use **open-source models running locally** as free replacements for Studio-only features. Works with **DaVinci Resolve Free** (no Studio license required).
 
 ## How It Works
 
@@ -27,7 +27,7 @@ DaVinci Resolve API
 
 ## Features
 
-### 44 MCP Tools
+### 51 MCP Tools
 
 **Read (9 tools):** project info, current page, timeline details, clip lists, markers, render settings, media pool contents, render formats
 
@@ -42,11 +42,15 @@ DaVinci Resolve API
 - **Rendering** — configure settings, set format/codec, manage render queue, start/stop renders
 - **Project** — save, export current frame, modify project/timeline settings, auto-subtitles, scene detection
 
-**Transcription (2 tools):**
-- **transcribe_timeline** — transcribe the current timeline's audio using local Whisper (via [faster-whisper](https://github.com/SYSTRAN/faster-whisper))
-- **transcribe_file** — transcribe any audio/video file
+**AI Tools (9 tools) — open-source replacements for Studio features:**
 
-Models run locally on CPU with no cloud dependency. First run downloads the model (~483MB for `small`).
+| Studio Feature | Open-Source Replacement | MCP Tools |
+|---|---|---|
+| Voice Isolation (Neural Engine) | [Demucs v4](https://github.com/facebookresearch/demucs) by Meta | `voice_isolate`, `voice_isolate_timeline` |
+| Magic Mask (AI segmentation) | [rembg](https://github.com/danielgatis/rembg) with BiRefNet | `remove_background`, `remove_background_video`, `remove_background_clip` |
+| Subtitle Generation | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) | `transcribe_timeline`, `transcribe_file` |
+
+All AI models run locally on CPU with no cloud dependency. Models are downloaded automatically on first use.
 
 ## Setup
 
@@ -134,6 +138,8 @@ Once the bridge is running, you can ask your AI assistant things like:
 - *"Set the opacity of the first clip on video track 2 to 70%"*
 - *"Zoom in the first clip to 120%"*
 - *"Transcribe my timeline audio"*
+- *"Isolate the vocals from my timeline audio"*
+- *"Remove the background from the first clip on video track 1"*
 - *"Set up a render to MP4 H.265 and start rendering"*
 - *"Import these files into the media pool: ..."*
 
@@ -148,13 +154,33 @@ The bridge exposes a clean HTTP API:
 
 All responses are JSON. The MCP server translates between MCP tool calls and these HTTP endpoints.
 
-## Transcription
+## AI Features — Studio Replacements
 
-The MCP server includes built-in audio transcription powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (a CTranslate2 reimplementation of OpenAI's Whisper). Transcription runs entirely on your local CPU.
+These features use open-source models to replicate capabilities that normally require DaVinci Resolve Studio ($295). All processing runs locally on your CPU.
 
-Available models: `tiny`, `base`, `small` (default), `medium`, `large-v3`
+### Voice Isolation (replaces Studio Voice Isolation)
 
-The model is automatically downloaded on first use and cached locally.
+Powered by [Demucs v4](https://github.com/facebookresearch/demucs) (Hybrid Transformer) by Meta Research. Separates audio into stems: **vocals**, **drums**, **bass**, and **other**. Use two-stem mode to get clean `vocals.wav` and `no_vocals.wav` files.
+
+- **Models:** `htdemucs` (default, best quality), `htdemucs_ft` (4x slower, slightly better), `mdx_extra`
+- **Speed:** ~1.5x real-time on CPU (60s audio takes ~90s)
+- **First run:** Downloads the model (~150MB)
+
+### Background Removal (replaces Studio Magic Mask)
+
+Powered by [rembg](https://github.com/danielgatis/rembg) with BiRefNet, U2-Net, and other segmentation models. Removes backgrounds from images and video frame-by-frame, producing either transparent PNGs or black/white matte videos.
+
+- **Models:** `birefnet-general` (default, best quality), `birefnet-general-lite` (faster), `u2net`, `u2net_human_seg` (people only), `isnet-general-use`
+- **Speed:** ~0.5-2s per frame on CPU depending on resolution
+- **Output formats:** PNG sequence with alpha channel, or grayscale matte video (MP4)
+- **Requires:** ffmpeg for video frame extraction/reassembly
+
+### Transcription (replaces Studio Subtitle Generation)
+
+Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 reimplementation of OpenAI's Whisper). Generates word-level timestamps.
+
+- **Models:** `tiny`, `base`, `small` (default), `medium`, `large-v3`
+- **First run:** Downloads the model (~483MB for `small`)
 
 ## Limitations
 
@@ -162,7 +188,7 @@ The model is automatically downloaded on first use and cached locally.
 - **Fusion node parameters** (text content, effects) require manual editing in the Fusion page
 - **Transitions** must be added manually from the Effects Library
 - **Color grading** adjustments are not exposed through the scripting API
-- Some features like auto-subtitles and magic mask are **Studio-only**
+- **Video background removal** is CPU-bound and can be slow for long clips — consider processing short segments
 
 ## License
 
