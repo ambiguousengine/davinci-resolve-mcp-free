@@ -1,115 +1,120 @@
-# DaVinci Resolve MCP Bridge
+# 🎬 DaVinci Resolve MCP Bridge
 
-Control DaVinci Resolve from AI coding assistants like Cursor using the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+### The only MCP server for DaVinci Resolve that works on the **Free version**.
 
-This bridge gives your AI assistant **full read and write access** to DaVinci Resolve — query timelines, manipulate clips, add markers, insert titles, control rendering, transcribe audio, isolate vocals, and remove video backgrounds. All AI features use **open-source models running locally** as free replacements for Studio-only features. Works with **DaVinci Resolve Free** (no Studio license required).
+> "Add a marker at 5 seconds." "Transcribe my timeline." "Remove the background from clip 1." "Render to MP4."
+>
+> Just talk to your AI assistant. It controls Resolve for you.
 
-## How It Works
+[![Free + Studio](https://img.shields.io/badge/DaVinci%20Resolve-Free%20%2B%20Studio-00b359.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-162-blue.svg)](#-162-tools-across-every-feature-of-resolve)
+[![AI](https://img.shields.io/badge/Local%20AI-Voice%20%7C%20Background%20%7C%20Transcription-purple.svg)](#-built-in-ai-that-replaces-295-studio-features)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The bridge uses a two-part architecture to work around the Free version's lack of external scripting:
+---
+
+## 🤔 What Is This?
+
+This project lets AI assistants like **Cursor**, **Claude**, or **Windsurf** control DaVinci Resolve through natural language. Instead of clicking through menus, you just *tell* the AI what to do — and it does it.
+
+Think of it like giving your AI assistant a pair of hands inside DaVinci Resolve.
+
+---
+
+## ⚡ What Makes This Different?
+
+Every other DaVinci Resolve MCP server requires the **$295 Studio version** because they use "external scripting" — a feature Blackmagic locks behind the paywall.
+
+**This project works around that entirely.**
+
+Instead of calling Resolve from the outside, a small bridge script runs *inside* Resolve (through the Scripts menu, which is available to everyone). That bridge opens a local connection, and the MCP server talks to it. Simple — and it works on the Free version.
 
 ```
-Cursor (AI Assistant)
-    │
-    │  MCP Protocol (stdio)
-    ▼
-resolve_mcp_bridge.py        ← MCP server (runs on your machine)
-    │
-    │  HTTP (localhost:9876)
-    ▼
-CursorBridge.py              ← Runs INSIDE DaVinci Resolve
-    │                           (Workspace > Scripts > CursorBridge)
-    ▼
-DaVinci Resolve API
+Your AI Assistant (Cursor, Claude, etc.)
+         │
+         │  talks MCP
+         ▼
+  resolve_mcp_bridge.py     ← runs on your machine
+         │
+         │  talks HTTP (localhost)
+         ▼
+  CursorBridge.py           ← runs INSIDE Resolve (Workspace > Scripts)
+         │
+         ▼
+  DaVinci Resolve API       ← full read + write access
 ```
 
-**CursorBridge.py** runs as an internal Fusion script inside Resolve, exposing an HTTP API on `localhost:9876`. **resolve_mcp_bridge.py** is the MCP server that Cursor talks to — it translates MCP tool calls into HTTP requests to the bridge.
+**155 of 162 tools work on Free.** The 7 that don't are Studio's Neural Engine features — and for each one, this project includes a **free, local AI replacement** that runs on your CPU.
 
-## Features
+---
 
-### 162 MCP Tools
+## 🧠 Built-In AI That Replaces $295 Studio Features
 
-**Read (31 endpoints):** project info, current page, timeline details, clip lists, markers, render settings & resolutions, media pool contents & folder structure, clip metadata & properties, per-clip markers & flags, node graph & LUT info, color versions, color groups, Fusion compositions, takes, linked items, voice isolation state, Fairlight presets, current video item, clip thumbnail, gallery albums & stills, keyframe mode, project list, database list, media storage, quick export presets
+No API keys. No cloud. No subscriptions. These run locally on your machine using open-source models:
 
-**Write (124 endpoints):**
-- **Navigation** — switch pages, move playhead
-- **Markers** — add/delete timeline markers
-- **Per-Clip Markers & Flags** — add/get/delete markers on individual clips, add/get/clear flags
-- **Timeline** — create, rename, duplicate, switch, export (AAF/EDL/FCPXML/OTIO), set/clear mark in/out
-- **Timeline Clip Manipulation** — delete clips (with ripple), link/unlink clips, create compound clips, create Fusion clips
-- **Tracks** — add, delete, enable/disable, lock/unlock, rename
-- **Media Pool Deep Access** — navigate folders, create subfolders, get/set clip metadata & properties, move/delete/relink/unlink clips, auto-sync audio, import timelines from file, export metadata to CSV, replace clips
-- **Media** — import files, import from storage, append/insert clips to timeline
-- **Media Storage** — browse volumes, list files/folders, reveal in storage panel
-- **Clips** — set color, enable/disable, transform properties, render cache, update sidecar (BRAW/R3D)
-- **Color Grading** — set/get LUT on nodes, enable/disable nodes, apply grade from DRX, set CDL values, export LUT, copy grades between clips, reset grades, reset node colors, ARRI CDL/LUT
-- **Color Versions** — add, load, delete, rename local/remote versions
-- **Color Groups** — create, delete, assign clips to groups, remove from groups
-- **Fusion Compositions** — list, add, import, export, delete, load, rename per-clip Fusion comps
-- **Smart Features (Studio)** — Magic Mask (create/regenerate), Stabilize, Smart Reframe
-- **Audio/Fairlight** — apply Fairlight presets, insert audio at playhead, get/set voice isolation state (per-track and per-clip)
-- **Take Selector** — add takes, select, delete, finalize
-- **Proxy Management** — link/unlink proxy media, replace clip source
-- **Titles & Generators** — insert Text+, generators, Fusion compositions
-- **Rendering** — configure settings, set format/codec, manage render queue, start/stop, job status, render mode, quick export, render presets, LUT refresh, render resolutions
-- **Gallery & Stills** — list/create albums, grab stills (single or all clips), export/import/delete stills, set labels
-- **Project** — save, export current frame, modify project/timeline settings, auto-subtitles, scene detection
-- **Project Manager** — list/load/create/delete projects, archive/export/import projects, navigate project folders, switch databases
-- **Presets** — layout presets (save/load/export/import), render presets, burn-in presets, keyframe mode
-
-**AI Tools (7 tools) — open-source replacements for Studio features:**
-
-| Studio Feature | Open-Source Replacement | MCP Tools |
+| You'd normally need Studio for... | This gives you instead | Powered by |
 |---|---|---|
-| Voice Isolation (Neural Engine) | [Demucs v4](https://github.com/facebookresearch/demucs) by Meta | `voice_isolate`, `voice_isolate_timeline` |
-| Magic Mask (AI segmentation) | [rembg](https://github.com/danielgatis/rembg) with BiRefNet | `remove_background`, `remove_background_video`, `remove_background_clip` |
-| Subtitle Generation | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) | `transcribe_timeline`, `transcribe_file` |
+| 🎤 **Voice Isolation** | Separate vocals from music/noise | [Demucs v4](https://github.com/facebookresearch/demucs) by Meta |
+| ✂️ **Background Removal** | Remove backgrounds from images & video | [rembg](https://github.com/danielgatis/rembg) + BiRefNet |
+| 📝 **Auto Subtitles** | Transcribe audio with word-level timestamps | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) |
 
-All AI models run locally on CPU with no cloud dependency. Models are downloaded automatically on first use.
+Models download automatically on first use. Everything runs on CPU — no GPU required.
 
-## Setup
+---
 
-### Prerequisites
+## 🎛️ 162 Tools Across Every Feature of Resolve
 
-- DaVinci Resolve 18+ (Free or Studio)
-- Python 3.9+ on the same machine as Resolve
-- An MCP-compatible AI assistant (Cursor, Claude Desktop, etc.)
+This isn't a demo with 5 tools. It covers the **entire** DaVinci Resolve experience:
 
-### 1. Install the CursorBridge script
+| Area | What you can do |
+|------|----------------|
+| **Timeline** | Create, rename, duplicate, switch timelines. Add/remove clips. Insert at specific frames. Delete with ripple. |
+| **Clips** | Set color, opacity, zoom, pan, tilt, rotation, crop, flip, composite mode, scaling. Enable/disable. |
+| **Markers & Flags** | Add/delete colored markers with notes on timelines and individual clips. Manage flags. |
+| **Media Pool** | Import files, browse folders, move/delete/relink clips, auto-sync audio, export metadata. |
+| **Color Grading** | Apply LUTs, set CDL values, copy grades between clips, manage color versions and groups, reset grades. |
+| **Fusion** | List, add, import, export, delete, load, rename Fusion compositions on any clip. |
+| **Rendering** | Configure settings, set format/codec, manage the render queue, start/stop rendering, quick export. |
+| **Titles** | Insert Text+, generators, and Fusion compositions directly onto the timeline. |
+| **Audio** | Apply Fairlight presets, insert audio at playhead, voice isolation (per-track and per-clip). |
+| **Gallery** | Create albums, grab stills, export/import stills, set labels. |
+| **Tracks** | Add, delete, rename, lock/unlock, enable/disable video/audio/subtitle tracks. |
+| **Project Management** | List, create, load, delete, archive, export, import projects. Switch databases. |
+| **AI Tools** | Transcribe audio, isolate vocals, remove backgrounds — all locally, no Studio required. |
 
-Copy `src/CursorBridge.py` to your DaVinci Resolve scripts folder:
+---
 
-**Windows:**
-```
-%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
-```
+## 🚀 Getting Started
 
-**macOS:**
-```
-~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/
-```
+### What You Need
 
-**Linux:**
-```
-~/.local/share/DaVinciResolve/Fusion/Scripts/
-```
+- **DaVinci Resolve 18+** (Free or Studio — both work)
+- **Python 3.9+** on the same machine as Resolve
+- **Cursor**, Claude Desktop, or any MCP-compatible AI assistant
 
-### 2. Set up the MCP server
+### Step 1 — Install the bridge script inside Resolve
+
+Copy `src/CursorBridge.py` to your Resolve scripts folder:
+
+| Platform | Path |
+|----------|------|
+| **Windows** | `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\` |
+| **macOS** | `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/` |
+| **Linux** | `~/.local/share/DaVinciResolve/Fusion/Scripts/` |
+
+### Step 2 — Set up the MCP server
 
 ```bash
-# Clone the repo
 git clone https://github.com/hiteshK03/davinci-resolve-mcp.git
 cd davinci-resolve-mcp
-
-# Create a virtual environment and install dependencies
 python -m venv venv
-source venv/bin/activate  # or venv\Scripts\activate on Windows
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure your AI assistant
+### Step 3 — Tell your AI assistant about it
 
-Add to your MCP configuration (e.g., `.cursor/mcp.json`):
+Add to your `.cursor/mcp.json` (or equivalent):
 
 ```json
 {
@@ -122,7 +127,9 @@ Add to your MCP configuration (e.g., `.cursor/mcp.json`):
 }
 ```
 
-On **Windows with WSL** (Cursor running in WSL, Resolve on Windows):
+<details>
+<summary><strong>Windows + WSL setup</strong> (Cursor in WSL, Resolve on Windows)</summary>
+
 ```json
 {
   "mcpServers": {
@@ -133,92 +140,81 @@ On **Windows with WSL** (Cursor running in WSL, Resolve on Windows):
   }
 }
 ```
+</details>
 
-### 4. Start the bridge
+### Step 4 — Start using it
 
 1. Open DaVinci Resolve
-2. Go to **Workspace > Scripts > CursorBridge**
-3. The console should show: `Bridge is running (read + write). 8 GET routes, 37 POST routes.`
-4. Your AI assistant can now control Resolve
+2. Go to **Workspace → Scripts → CursorBridge**
+3. Console shows: `Bridge is running (read + write)`
+4. Talk to your AI assistant — it now controls Resolve
 
-The bridge supports **hot-reload** — re-running the script from the menu will gracefully replace the previous instance.
+---
 
-## Usage Examples
+## 💬 Things You Can Say
 
-Once the bridge is running, you can ask your AI assistant things like:
+```
+"What's on my timeline right now?"
+"Import these files into the media pool"
+"Add a green marker at 5 seconds called 'intro ends'"
+"Insert a Text+ title at the playhead"
+"Set the first clip on track 2 to 70% opacity"
+"Zoom in clip 1 to 120% and shift it left"
+"Transcribe my timeline audio"
+"Isolate the vocals from my timeline"
+"Remove the background from clip 1 on video track 1"
+"Apply this LUT to node 1 of the current clip"
+"Set up an MP4 H.265 render and start it"
+"Export the timeline as FCPXML"
+"Grab a still from the current frame"
+```
 
-- *"What's on my timeline right now?"*
-- *"Add a green marker at the 5 second mark called 'intro ends'"*
-- *"Insert a Text+ title at the playhead"*
-- *"Set the opacity of the first clip on video track 2 to 70%"*
-- *"Zoom in the first clip to 120%"*
-- *"Transcribe my timeline audio"*
-- *"Isolate the vocals from my timeline audio"*
-- *"Remove the background from the first clip on video track 1"*
-- *"Set up a render to MP4 H.265 and start rendering"*
-- *"Import these files into the media pool: ..."*
+---
 
-## Architecture
+## 🔁 Works With the Full Pipeline
 
-The bridge exposes a clean HTTP API (31 GET + 124 POST = 155 endpoints):
+This is one piece of a three-server video production setup:
 
-| Method | Endpoints | Purpose |
-|--------|-----------|---------|
-| `GET`  | `/status`, `/project`, `/page`, `/timeline`, `/timeline/clips`, `/timeline/markers`, `/timeline/current-item`, `/timeline/thumbnail`, `/render`, `/mediapool`, `/mediapool/structure`, `/mediapool/clip/metadata`, `/mediapool/clip/info`, `/clip/markers`, `/clip/flags`, `/gallery/albums`, `/gallery/stills` | Read-only queries |
-| `POST` | `/page`, `/playhead`, `/marker/*`, `/timeline/*`, `/track/*`, `/media/*`, `/mediapool/*`, `/clip/*`, `/title/*`, `/generator/*`, `/fusion/*`, `/render/*`, `/project/*`, `/gallery/*` | Write/mutation operations |
+| Server | What it does |
+|--------|-------------|
+| **This (DaVinci Resolve MCP)** | Controls Resolve — timelines, clips, color, rendering, local AI |
+| [**mcp-image-gen**](https://github.com/hiteshK03/mcp-image-gen) | Generates images locally (backgrounds, textures, overlays) — no API keys |
+| **Video Editor MCP** | File-based video processing (ffmpeg, overlays, transitions) — no Resolve needed |
 
-All responses are JSON. The MCP server translates between MCP tool calls and these HTTP endpoints.
+The AI assistant orchestrates across all three automatically. Generate an image → import into Resolve → place on timeline → adjust properties — all from a single conversation.
 
-## AI Features — Studio Replacements
+---
 
-These features use open-source models to replicate capabilities that normally require DaVinci Resolve Studio ($295). All processing runs locally on your CPU.
+## 📋 Free vs Studio Compatibility
 
-### Voice Isolation (replaces Studio Voice Isolation)
+| Feature | Studio | Free + This Project |
+|---------|--------|-------------------|
+| Timeline editing, clips, markers | ✅ | ✅ |
+| Color grading, LUTs, CDL | ✅ | ✅ |
+| Rendering, export | ✅ | ✅ |
+| Media pool, project management | ✅ | ✅ |
+| Fusion compositions | ✅ | ✅ |
+| Gallery & stills | ✅ | ✅ |
+| Voice Isolation | ✅ Neural Engine | ✅ Demucs v4 (local) |
+| Background Removal | ✅ Magic Mask | ✅ rembg/BiRefNet (local) |
+| Auto Subtitles | ✅ Neural Engine | ✅ faster-whisper (local) |
+| Smart Reframe | ✅ | ❌ |
+| Stabilization | ✅ | ❌ |
 
-Powered by [Demucs v4](https://github.com/facebookresearch/demucs) (Hybrid Transformer) by Meta Research. Separates audio into stems: **vocals**, **drums**, **bass**, and **other**. Use two-stem mode to get clean `vocals.wav` and `no_vocals.wav` files.
+**155/162 tools work on Free. The 5 that don't have local AI replacements. Only 2 have no alternative (Smart Reframe, Stabilization).**
 
-- **Models:** `htdemucs` (default, best quality), `htdemucs_ft` (4x slower, slightly better), `mdx_extra`
-- **Speed:** ~1.5x real-time on CPU (60s audio takes ~90s)
-- **First run:** Downloads the model (~150MB)
+---
 
-### Background Removal (replaces Studio Magic Mask)
+## ⚠️ Limitations
 
-Powered by [rembg](https://github.com/danielgatis/rembg) with BiRefNet, U2-Net, and other segmentation models. Removes backgrounds from images and video frame-by-frame, producing either transparent PNGs or black/white matte videos.
+- **Keyframe animations** — the scripting API only supports static property values, not animated keyframes
+- **Fusion node parameters** — text content and effect values inside compositions need the Fusion page UI
+- **Transitions** — must be added manually from the Effects Library
+- **Background removal on video** — CPU-bound, can be slow for long clips
+- **Gallery stills** — require being on the Color page
 
-- **Models:** `birefnet-general` (default, best quality), `birefnet-general-lite` (faster), `u2net`, `u2net_human_seg` (people only), `isnet-general-use`
-- **Speed:** ~0.5-2s per frame on CPU depending on resolution
-- **Output formats:** PNG sequence with alpha channel, or grayscale matte video (MP4)
-- **Requires:** ffmpeg for video frame extraction/reassembly
+---
 
-### Transcription (replaces Studio Subtitle Generation)
+## 📄 License
 
-Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 reimplementation of OpenAI's Whisper). Generates word-level timestamps.
-
-- **Models:** `tiny`, `base`, `small` (default), `medium`, `large-v3`
-- **First run:** Downloads the model (~483MB for `small`)
-
-## Free vs Studio Compatibility
-
-**155 of 162 tools work on DaVinci Resolve Free.** The remaining 7 require Studio (DaVinci Neural Engine). For each Studio-only feature, a local open-source AI alternative is provided that works on Free.
-
-| Feature | Studio Tool | Free Alternative (Local AI) |
-|---|---|---|
-| Voice Isolation | `get_voice_isolation_state`, `set_voice_isolation_state` | `voice_isolate`, `voice_isolate_timeline` (Demucs v4) |
-| Magic Mask / BG Removal | `create_magic_mask`, `regenerate_magic_mask` | `remove_background`, `remove_background_video`, `remove_background_clip` (rembg/BiRefNet) |
-| Speech-to-Text | `create_subtitles_from_audio` | `transcribe_timeline`, `transcribe_file` (faster-whisper) |
-| Smart Reframe | `smart_reframe_clip` | — |
-| Stabilization | `stabilize_clip` | — |
-
-All tool docstrings are tagged: `[STUDIO ONLY]` for Studio-required tools, `[FREE + STUDIO · LOCAL AI]` for local AI alternatives.
-
-## Limitations
-
-- **Keyframe animations** cannot be set via the scripting API — only static property values
-- **Fusion node parameters** inside compositions (text content, effect values) require the Fusion page UI
-- **Transitions** must be added manually from the Effects Library
-- **Video background removal** (local AI) is CPU-bound and can be slow for long clips — consider processing short segments
-- **Gallery stills** require being on the Color page for grab operations
-
-## License
-
-MIT
+MIT — use it however you want.
