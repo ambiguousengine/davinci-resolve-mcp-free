@@ -2820,7 +2820,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2832,7 +2831,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _blocked(self):
+        # Hardening (this fork): anti-CSRF / anti-DNS-rebinding guard.
+        # A legitimate local MCP client never sends an Origin header; a browser does.
+        if self.headers.get("Origin") is not None:
+            return True
+        host = (self.headers.get("Host") or "").strip()
+        if host not in ("127.0.0.1:%d" % PORT, "localhost:%d" % PORT, ""):
+            return True
+        return False
+
     def do_GET(self):
+        if self._blocked():
+            self._error(403, "Forbidden")
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         qs = parse_qs(parsed.query)
@@ -2846,6 +2858,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._error(404, "Unknown GET endpoint: %s" % path)
 
     def do_POST(self):
+        if self._blocked():
+            self._error(403, "Forbidden")
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         content_len = int(self.headers.get("Content-Length", 0))
@@ -2865,10 +2880,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._error(404, "Unknown POST endpoint: %s" % path)
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # No permissive CORS (hardened): the browser gets no cross-origin grant.
+        self.send_response(403)
         self.end_headers()
 
 
