@@ -366,6 +366,67 @@ def gather_media_pool():
     }
 
 
+def gather_media_pool_audit(qs):
+    """Every media pool item with folder path, file path, mediaId and Usage.
+
+    Exists because every other clip lookup in this bridge addresses items BY
+    NAME, and a name is ambiguous exactly where it matters --- QMC-Storm holds
+    35 repeated names across RUSHES / _AUDIT_SCRATCH / TRASH / REF. Worse, a
+    repeated name is not necessarily a duplicate FILE: nike-ai.mp4 exists as
+    .../Storm/ref/nike-ai.mp4 and .../Storm/1_source/video/nike-ai.mp4, which
+    are different assets. So "de-duplicate by name" is unsafe by construction.
+
+    Usage is Resolve's own count of how many timelines reference the item, so
+    Usage == 0 is the only defensible basis for proposing a deletion. Items
+    with no File Path are timelines/compounds living in the pool, flagged
+    separately --- deleting one of those destroys an edit, not a reference.
+    """
+    _, proj, err = _project()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    if not pool:
+        return {"error": "No media pool"}
+
+    items = []
+
+    def walk(folder, path):
+        name = safe(lambda: folder.GetName()) or "?"
+        here = (path + "/" + name) if path else name
+        for c in (safe(lambda: folder.GetClipList()) or []):
+            props = safe(lambda c=c: c.GetClipProperty()) or {}
+            if not isinstance(props, dict):
+                props = {}
+            usage_raw = props.get("Usage")
+            try:
+                usage = int(str(usage_raw).strip() or "0")
+            except (TypeError, ValueError):
+                usage = None
+            file_path = props.get("File Path") or ""
+            items.append({
+                "folder": here,
+                "name": safe(lambda c=c: c.GetName()),
+                "mediaId": safe(lambda c=c: c.GetMediaId()),
+                "filePath": file_path,
+                "usage": usage,
+                "usageRaw": usage_raw,
+                "isTimelineOrGenerator": not file_path,
+            })
+        for sf in (safe(lambda: folder.GetSubFolderList()) or []):
+            walk(sf, here)
+
+    root = pool.GetRootFolder()
+    if root:
+        walk(root, "")
+
+    unused = [i for i in items if i["usage"] == 0 and not i["isTimelineOrGenerator"]]
+    return {
+        "count": len(items),
+        "unusedMediaCount": len(unused),
+        "items": items,
+    }
+
+
 def gather_media_pool_structure(qs):
     """Get the media pool folder tree structure."""
     _, proj, err = _project()
@@ -1229,6 +1290,135 @@ def _folder_basenames(folder_path):
         for f in files:
             found.add(f.lower())
     return found
+
+
+def _pool_items_by_ids(pool, ids):
+    """Resolve mediaIds to items in ONE pool walk. mediaId is unique; a name is not."""
+    want = set(ids)
+    found = {}
+
+    def search(folder):
+        for c in (safe(lambda: folder.GetClipList()) or []):
+            mid = safe(lambda c=c: c.GetMediaId())
+            if mid in want:
+                found[mid] = c
+        for sf in (safe(lambda: folder.GetSubFolderList()) or []):
+            search(sf)
+
+    root = pool.GetRootFolder()
+    if root:
+        search(root)
+    return found
+
+
+def _item_usage(item):
+    props = safe(lambda: item.GetClipProperty()) or {}
+    if not isinstance(props, dict):
+        return None
+    try:
+        return int(str(props.get("Usage", "0")).strip() or "0")
+    except (TypeError, ValueError):
+        return None
+
+
+def action_move_media_pool_clips_by_id(body):
+    """Move clips addressed by mediaId. Verifies each landed in the target folder."""
+    _, proj, err = _project()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    if not pool:
+        return {"error": "No media pool"}
+    ids = body.get("mediaIds", [])
+    target_path = body.get("targetFolder", "")
+    if not ids:
+        return {"error": "mediaIds array is required"}
+    if not target_path:
+        return {"error": "targetFolder path is required"}
+    target = _find_folder_by_path(pool, target_path)
+    if not target:
+        return {"error": "Target folder not found: '%s'" % target_path}
+
+    found = _pool_items_by_ids(pool, ids)
+    missing = [i for i in ids if i not in found]
+    if not found:
+        return {"error": "No clips matched those mediaIds", "missing": missing, "moved": 0}
+
+    ok = pool.MoveClips(list(found.values()), target)
+
+    # Verify at the destination: re-read the target folder and confirm arrival.
+    landed = set()
+    for c in (safe(lambda: target.GetClipList()) or []):
+        mid = safe(lambda c=c: c.GetMediaId())
+        if mid in found:
+            landed.add(mid)
+    not_landed = [i for i in found if i not in landed]
+    return {
+        "success": bool(ok) and not not_landed,
+        "moved": len(landed),
+        "requested": len(ids),
+        "notLanded": not_landed,
+        "missing": missing,
+        "apiReturned": bool(ok),
+    }
+
+
+def action_delete_media_pool_clips_by_id(body):
+    """Delete clips addressed by mediaId. REFUSES anything Resolve reports as in use.
+
+    Usage is Resolve's own count of timeline references. The guard is the whole
+    point of this verb: a name-addressed delete in a pool with repeated names
+    will eventually remove the copy an edit depends on. Pass force=true only
+    with a deliberate reason.
+    """
+    _, proj, err = _project()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    if not pool:
+        return {"error": "No media pool"}
+    ids = body.get("mediaIds", [])
+    force = bool(body.get("force", False))
+    if not ids:
+        return {"error": "mediaIds array is required"}
+
+    found = _pool_items_by_ids(pool, ids)
+    missing = [i for i in ids if i not in found]
+    if not found:
+        return {"error": "No clips matched those mediaIds", "missing": missing, "deleted": 0}
+
+    in_use = []
+    for mid, item in found.items():
+        u = _item_usage(item)
+        if u is None or u > 0:
+            in_use.append({
+                "mediaId": mid,
+                "name": safe(lambda item=item: item.GetName()),
+                "usage": u,
+            })
+    if in_use and not force:
+        return {
+            "error": "Refusing to delete: %d of %d clips are reported in use by a "
+                     "timeline (or their usage could not be read). Nothing was "
+                     "deleted. Pass force=true only if you mean it." % (len(in_use), len(found)),
+            "inUse": in_use,
+            "deleted": 0,
+        }
+
+    targets = list(found.values())
+    ok = pool.DeleteClips(targets)
+
+    # Verify at the destination: the ids must no longer resolve anywhere.
+    still = _pool_items_by_ids(pool, list(found.keys()))
+    return {
+        "success": bool(ok) and not still,
+        "deleted": len(found) - len(still),
+        "requested": len(ids),
+        "stillPresent": list(still.keys()),
+        "missing": missing,
+        "forced": force,
+        "apiReturned": bool(ok),
+    }
 
 
 def action_relink_media_pool_clips(body):
@@ -2781,6 +2971,7 @@ GET_ROUTES = {
     "/render/quick-export-presets": gather_quick_export_presets,
     "/mediapool":               lambda qs: gather_media_pool(),
     "/mediapool/structure":     gather_media_pool_structure,
+    "/mediapool/audit":         gather_media_pool_audit,
     "/mediapool/clip/metadata": gather_clip_metadata,
     "/mediapool/clip/info":     gather_clip_info,
     "/clip/markers":            gather_clip_markers,
@@ -2847,6 +3038,8 @@ POST_ROUTES = {
     "/mediapool/clip/property":     action_set_pool_clip_property,
     "/mediapool/clips/delete":      action_delete_media_pool_clips,
     "/mediapool/clips/move":        action_move_media_pool_clips,
+    "/mediapool/clips/move_by_id":  action_move_media_pool_clips_by_id,
+    "/mediapool/clips/delete_by_id": action_delete_media_pool_clips_by_id,
     "/mediapool/clips/relink":      action_relink_media_pool_clips,
     "/mediapool/clips/unlink":      action_unlink_media_pool_clips,
     "/mediapool/audio-sync":        action_auto_sync_audio,
