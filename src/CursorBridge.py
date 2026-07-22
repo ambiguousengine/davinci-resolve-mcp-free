@@ -128,6 +128,30 @@ def _find_pool_item(pool, name):
     return search(root) if root else None
 
 
+def _find_pool_items_all(pool, name):
+    """Every media pool item matching `name` --- not just the first.
+
+    _find_pool_item() stops at the first hit, which makes every name-based verb
+    non-deterministic when the same filename exists in several bins (RUSHES /
+    _AUDIT_SCRATCH / TRASH). The first hit is routinely NOT the one the timeline
+    references, so a clip can read as 'online' in the pool while the timeline
+    instance stays offline. Callers that must not guess use this and fail loud.
+    """
+    hits = []
+
+    def search(folder):
+        for c in (folder.GetClipList() or []):
+            if safe(lambda: c.GetName()) == name:
+                hits.append(c)
+        for sf in (folder.GetSubFolderList() or []):
+            search(sf)
+
+    root = pool.GetRootFolder()
+    if root:
+        search(root)
+    return hits
+
+
 def _find_folder_by_path(pool, path):
     """Find a media pool folder by slash-separated path (e.g. 'Footage/Day1')."""
     root = pool.GetRootFolder()
@@ -1190,7 +1214,41 @@ def action_move_media_pool_clips(body):
     return {"success": bool(ok), "moved": len(items)}
 
 
+def _clip_file_path(item):
+    """Current 'File Path' property of a media pool item, or '' if unreadable."""
+    props = safe(lambda: item.GetClipProperty()) or {}
+    if isinstance(props, dict):
+        return props.get("File Path") or ""
+    return safe(lambda: item.GetClipProperty("File Path")) or ""
+
+
+def _folder_basenames(folder_path):
+    """Lower-cased basenames of every file under folder_path (recursive)."""
+    found = set()
+    for root, _dirs, files in os.walk(folder_path):
+        for f in files:
+            found.add(f.lower())
+    return found
+
+
 def action_relink_media_pool_clips(body):
+    """Relink pool clips to files in a folder, and report what ACTUALLY relinked.
+
+    The previous version returned {"success": True, "relinked": len(items)} where
+    len(items) was the number of clips *looked up*, not the number relinked --- and
+    Resolve's RelinkClips() returns True even when the target folder contains none
+    of the files. So it reported 26 relinked against a folder holding zero matches.
+    Every relink in a whole session was reported as landing; most had not.
+
+    This version refuses to guess:
+      * names matching more than one pool item are AMBIGUOUS -> fail loud, because
+        _find_pool_item silently takes the first hit and it is routinely not the
+        one the timeline references (duplicate filenames across RUSHES/TRASH/etc).
+      * if the folder contains no file matching any requested clip, that is an
+        error, not a success.
+      * the returned count is verified AFTER the fact by re-reading each item's
+        File Path and confirming it now points at a file that exists on disk.
+    """
     _, proj, err = _project()
     if err:
         return err
@@ -1203,11 +1261,72 @@ def action_relink_media_pool_clips(body):
         return {"error": "clipNames array is required"}
     if not folder_path:
         return {"error": "folderPath is required (filesystem path)"}
-    items = [i for name in clip_names for i in [_find_pool_item(pool, name)] if i]
+    if not os.path.isdir(folder_path):
+        return {"error": "folderPath is not a directory: '%s'" % folder_path}
+
+    # Resolve every name, keeping ambiguity visible instead of taking the first hit.
+    items, not_found, ambiguous = [], [], []
+    for name in clip_names:
+        matches = _find_pool_items_all(pool, name)
+        if not matches:
+            not_found.append(name)
+        elif len(matches) > 1:
+            ambiguous.append({"name": name, "count": len(matches)})
+        else:
+            items.append((name, matches[0]))
+
+    if ambiguous:
+        return {
+            "error": "Ambiguous clip name(s) --- more than one media pool item shares "
+                     "each of these names, so a name-based relink would pick an "
+                     "arbitrary one. Relink these from the timeline clip via 'Find in "
+                     "Media Pool' in the UI, or de-duplicate the pool first.",
+            "ambiguous": ambiguous,
+            "notFound": not_found,
+            "relinked": 0,
+        }
     if not items:
-        return {"error": "No matching clips found"}
-    ok = pool.RelinkClips(items, folder_path)
-    return {"success": bool(ok), "relinked": len(items)}
+        return {"error": "No matching clips found", "notFound": not_found, "relinked": 0}
+
+    # Decisive pre-check: does the folder actually hold any of these files? This is
+    # the exact case the old version reported as a success.
+    on_disk = _folder_basenames(folder_path)
+    wanted = [n for n, _ in items]
+    matchable = [n for n in wanted if n.lower() in on_disk]
+    if not matchable:
+        return {
+            "error": "Folder '%s' contains none of the requested clips --- nothing to "
+                     "relink. (%d file(s) scanned.)" % (folder_path, len(on_disk)),
+            "requested": wanted,
+            "notFound": not_found,
+            "relinked": 0,
+        }
+
+    before = {n: _clip_file_path(it) for n, it in items}
+    ok = pool.RelinkClips([it for _n, it in items], folder_path)
+
+    # Verify at the destination: re-read each path and confirm it exists on disk.
+    relinked, still_broken, unchanged = [], [], []
+    for name, item in items:
+        now = _clip_file_path(item)
+        if now and os.path.isfile(now):
+            if now != before.get(name):
+                relinked.append(name)
+            else:
+                unchanged.append(name)      # already pointed at a real file
+        else:
+            still_broken.append(name)
+
+    return {
+        "success": bool(ok) and not still_broken,
+        "relinked": len(relinked),
+        "relinkedClips": relinked,
+        "alreadyLinked": unchanged,
+        "stillBroken": still_broken,
+        "notFound": not_found,
+        "requested": len(clip_names),
+        "apiReturned": bool(ok),
+    }
 
 
 def action_unlink_media_pool_clips(body):
