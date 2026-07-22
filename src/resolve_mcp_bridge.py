@@ -82,13 +82,15 @@ def _get(endpoint: str, params: Optional[Dict[str, str]] = None) -> Dict[str, An
         url = f"{url}?{qs}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read().decode("utf-8"))
             if e.code == 404:
                 body["hint"] = "The CursorBridge may be outdated. Restart DaVinci Resolve and re-run CursorBridge."
+            elif e.code == 504:
+                body["hint"] = "A previous Resolve call may still be stuck in the background — safe to retry."
             return body
         except Exception:
             return {"error": f"Bridge returned HTTP {e.code}"}
@@ -107,13 +109,15 @@ def _post(endpoint: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
             body = json.loads(e.read().decode("utf-8"))
             if e.code in (404, 501):
                 body["hint"] = "The CursorBridge may be outdated. Restart DaVinci Resolve and re-run CursorBridge."
+            elif e.code == 504:
+                body["hint"] = "A previous Resolve call may still be stuck in the background — safe to retry."
             return body
         except Exception:
             return {"error": f"Bridge returned HTTP {e.code}"}

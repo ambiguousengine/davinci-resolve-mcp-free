@@ -11,14 +11,28 @@ POST endpoints = write / mutation operations
 """
 
 import json
+import os
 import sys
+import time
+import socketserver
 import traceback
+import concurrent.futures
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# ThreadingHTTPServer only exists in Python 3.7+. Resolve's embedded Python can be
+# 3.6, so build an equivalent from the mixin rather than importing it directly.
+try:
+    from http.server import ThreadingHTTPServer  # noqa: F401  (Python 3.7+)
+except ImportError:
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
 HOST = "127.0.0.1"
 PORT = 9876
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.1.0"
+RESOLVE_CALL_TIMEOUT = 25  # seconds — bound how long a single Resolve API call can block the bridge
 
 # ---------------------------------------------------------------------------
 # Resolve bootstrap — grab the object while Fusion globals are in scope
@@ -53,6 +67,79 @@ if resolve_obj:
         resolve_obj.GetProductName(), resolve_obj.GetVersionString()))
 else:
     print("[CursorBridge] WARNING: Could not obtain Resolve object.")
+
+
+# ---------------------------------------------------------------------------
+# Hardening: serialize all Resolve API calls through one worker + bounded timeout
+#
+# Resolve's scripting API is not safe to call concurrently from multiple threads,
+# so every request still executes one-at-a-time — but routing through a
+# ThreadPoolExecutor(max_workers=1) means a single call that blocks inside Resolve
+# (slow render/export, a modal dialog, a UI repaint) can no longer wedge the whole
+# HTTP server. It fails that one request cleanly after RESOLVE_CALL_TIMEOUT and
+# leaves the bridge able to keep serving subsequent requests (queued behind the
+# stuck one, each with its own bounded wait) instead of hanging forever and
+# requiring a manual restart.
+# ---------------------------------------------------------------------------
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ResolveCall")
+
+# Resolve's Workspace > Scripts console does NOT reliably define __file__, so
+# deriving the logs dir from it crashes the whole script at load time. Resolve any
+# base dir defensively, with a hardcoded fallback to the known install location and
+# then the OS temp dir, so logging can never take the bridge down.
+def _resolve_base_dir():
+    try:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    known = r"F:\AMBIGUITY\TOOLS\davinci-bridge"
+    if os.path.isdir(known):
+        return known
+    import tempfile
+    return tempfile.gettempdir()
+
+
+_BASE_DIR = _resolve_base_dir()
+_LOG_PATH = os.path.join(_BASE_DIR, "logs", "cursorbridge_calls.log")
+try:
+    os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+except Exception:
+    pass
+
+
+def _log(msg):
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (datetime.now().isoformat(timespec="seconds"), msg))
+    except Exception:
+        pass
+
+
+def _call_with_timeout(path, handler, arg):
+    """Run a route handler on the serialized Resolve worker, bounded by RESOLVE_CALL_TIMEOUT.
+    Returns (result, error_dict). On timeout, error_dict is set and the underlying
+    call is left running in the background (Python cannot forcibly kill a blocked
+    native call) — but the HTTP server itself stays responsive for new requests."""
+    start = time.monotonic()
+    _log("START %s" % path)
+    future = _executor.submit(handler, arg)
+    try:
+        result = future.result(timeout=RESOLVE_CALL_TIMEOUT)
+        _log("OK    %s (%.2fs)" % (path, time.monotonic() - start))
+        return result, None
+    except concurrent.futures.TimeoutError:
+        _log("STUCK %s (still running after %ss)" % (path, RESOLVE_CALL_TIMEOUT))
+        return None, {
+            "error": (
+                "Resolve call to '%s' did not return within %ss. DaVinci Resolve's "
+                "scripting API may be blocked (a slow render/export, a modal dialog, "
+                "or a busy UI repaint). The call may still finish in the background — "
+                "try again shortly. If every call keeps timing out, restart CursorBridge."
+            ) % (path, RESOLVE_CALL_TIMEOUT)
+        }
+    except Exception:
+        _log("ERROR %s\n%s" % (path, traceback.format_exc()))
+        return None, {"error": traceback.format_exc()}
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +978,1020 @@ def action_import_media_from_storage(body):
         "success": True,
         "imported": [safe(lambda i=i: i.GetName()) for i in items],
     }
+
+
+def _pool_item_by_ref(pool, body, key_id="mediaId", key_name="clip"):
+    """Resolve a media pool item from either a mediaId or a name.
+
+    mediaId is preferred and unambiguous. A name is a coin toss the moment the
+    same filename exists in two bins, which in this project it routinely does,
+    so a name that matches more than once is refused rather than guessed.
+    """
+    mid = body.get(key_id)
+    if mid:
+        found = _pool_items_by_ids(pool, [mid])
+        if not found:
+            return None, {"error": "No media pool item with mediaId %s" % mid}
+        return list(found.values())[0], None
+    name = body.get(key_name)
+    if not name:
+        return None, {"error": "Provide either %s or %s" % (key_id, key_name)}
+    hits = _find_pool_items_all(pool, name)
+    if not hits:
+        return None, {"error": "No media pool item named '%s'" % name}
+    if len(hits) > 1:
+        return None, {
+            "error": "'%s' matches %d pool items --- refusing to guess. "
+                     "Pass mediaId instead." % (name, len(hits)),
+            "candidates": [safe(lambda c=c: c.GetMediaId()) for c in hits],
+        }
+    return hits[0], None
+
+
+def _item_at_frame(tl, track_type, track_index, frame):
+    """The TimelineItem whose span contains `frame`, or None."""
+    for it in (safe(lambda: tl.GetItemListInTrack(track_type, track_index)) or []):
+        s = int(safe(lambda it=it: it.GetStart()) or 0)
+        e = int(safe(lambda it=it: it.GetEnd()) or 0)
+        if s <= frame < e:
+            return it
+    return None
+
+
+def _needs_markinout(item):
+    """Stills and compound clips ignore startFrame/endFrame on append.
+
+    A still reports Frames == 1 but Resolve gives it a virtual source starting
+    at frame 108000, and appending one always yields the 5-second default (150
+    frames @30) no matter what range is asked for. Compound clips behave the
+    same way. For both, SetMarkInOut on the POOL item is what actually governs
+    the placed length --- measured frame-exact at 20, 45 and 90 frames.
+    """
+    props = safe(lambda: item.GetClipProperty()) or {}
+    if not isinstance(props, dict):
+        return False
+    if not props.get("File Path"):
+        return True                       # compound clip / generator
+    try:
+        return int(props.get("Frames", 0)) <= 1
+    except (TypeError, ValueError):
+        return str(props.get("Type", "")).lower() == "still"
+
+
+def _place(pool, item, track_type, track_index, record_frame, src_in, frames):
+    """The one primitive. Returns (landed_item, error).
+
+    Verifies by re-reading the track: the API returns objects even in cases
+    where nothing committed, so the return value is not evidence.
+    """
+    if _needs_markinout(item):
+        # A still ignores startFrame/endFrame entirely (always the 5s default),
+        # so its length is governed by SetMarkInOut on the POOL item. But the
+        # mark range is interpreted at the MEDIA's frame rate and then conformed
+        # to the timeline's: on a 30fps timeline a 24fps still asked for 45
+        # frames lands as 56 (45 * 30/24). Rather than hardcode a ratio that is
+        # only right for one pairing, ask for N, measure what landed, and
+        # correct by the observed factor. One correction converges because the
+        # relationship is linear.
+        base = 108000                     # Resolve's virtual origin for stills
+        want = int(frames)
+
+        def attempt(mark_len, retries=2):
+            # Measured 2026-07-22: this same call sequence, on a fresh gap,
+            # committed cleanly on the first try in isolation (0/0.1/0.3s
+            # delay all landed fine) --- but failed once, silently, inside a
+            # long-lived bridge process mid-session (delete succeeded, the
+            # follow-up append did not commit, leaving a real gap). Root
+            # cause not pinned down; this retry exists because the failure
+            # mode is a GAP, not a wrong-but-safe value, so it is worth a
+            # couple of cheap extra attempts rather than surfacing at once.
+            for _ in range(retries + 1):
+                safe(lambda: item.SetMarkInOut(base, base + max(1, int(mark_len)) - 1, "video"))
+                safe(lambda: pool.AppendToTimeline([{
+                    "mediaPoolItem": item, "trackIndex": int(track_index),
+                    "recordFrame": int(record_frame), "mediaType": 1}]))
+                _, _, t, e = _timeline()
+                if e:
+                    return None
+                found = _item_at_frame(t, track_type, track_index, int(record_frame))
+                if found is not None:
+                    return found
+            return None
+
+        landed2 = attempt(want)
+        # Compound clips do NOT commit via SetMarkInOut --- nothing lands at all.
+        # They do commit, frame-exact, via the plain dict append, but ONLY when
+        # startFrame/endFrame are present; omit those keys and the append
+        # silently does nothing. (Measured: 60 frames asked, 60 landed.)
+        if landed2 is None:
+            for _ in range(3):
+                safe(lambda: pool.AppendToTimeline([{
+                    "mediaPoolItem": item, "startFrame": 0, "endFrame": int(frames),
+                    "trackIndex": int(track_index), "recordFrame": int(record_frame)}]))
+                _, _, t, e = _timeline()
+                if e:
+                    return None, e
+                landed2 = _item_at_frame(t, track_type, track_index, int(record_frame))
+                if landed2 is not None:
+                    return landed2, None
+            return None, {"error": "Nothing committed at %s track %d frame %d "
+                                   "after 3 attempts" % (track_type, track_index, record_frame)}
+        got = int(safe(lambda: landed2.GetDuration()) or 0)
+        if got != want and got > 0:
+            _, _, t, _e = _timeline()
+            safe(lambda: t.DeleteClips([landed2]))
+            corrected = attempt(int(round(want * want / float(got))))
+            if corrected is not None:
+                landed2 = corrected
+        return landed2, None
+
+    spec = {
+        "mediaPoolItem": item,
+        "startFrame": int(src_in),
+        "endFrame": int(src_in) + int(frames),   # EXCLUSIVE --- see module docstring
+        "trackIndex": int(track_index),
+        "recordFrame": int(record_frame),
+    }
+    if track_type == "audio":
+        spec["mediaType"] = 2
+    elif track_type == "video":
+        spec["mediaType"] = 1
+    for _ in range(3):
+        safe(lambda: pool.AppendToTimeline([spec]))
+        _, _, tl, err = _timeline()
+        if err:
+            return None, err
+        landed = _item_at_frame(tl, track_type, track_index, int(record_frame))
+        if landed:
+            return landed, None
+    return None, {"error": "Nothing committed at %s track %d frame %d after 3 attempts"
+                           % (track_type, track_index, record_frame)}
+
+
+def _describe(it):
+    return {
+        "name": safe(lambda: it.GetName()),
+        "start": int(safe(lambda: it.GetStart()) or 0),
+        "duration": int(safe(lambda: it.GetDuration()) or 0),
+    }
+
+
+# --------------------------------------------------------------------------
+# Undo log for the timeline verbs below.
+#
+# Resolve's own Undo (Ctrl+Z) is NOT exposed to scripting --- confirmed absent
+# on Project, Timeline, and TimelineItem (2026-07-22, after a CreateCompoundClip
+# test call left no scripted way back). So this is an application-level undo:
+# each verb records what it would take to reverse itself, in-memory, on this
+# bridge process. It does NOT see edits made through the Resolve UI or through
+# calls that bypass these verbs (e.g. a hand-written script) --- only actions
+# that went through place/swap/move/remove are undoable.
+#
+# Each entry is a (route, body) pair that reverses the operation when replayed
+# through the SAME dispatch functions below. That is deliberate: undoing an
+# undo just replays another forward op, which pushes its own reversing entry
+# --- so pressing undo twice is equivalent to a redo, with no separate redo
+# path to maintain.
+# --------------------------------------------------------------------------
+_UNDO_STACK = []
+_UNDO_MAX = 200
+
+
+def _push_undo(timeline_name, route, body):
+    _UNDO_STACK.append({"timeline": timeline_name, "route": route, "body": body})
+    del _UNDO_STACK[:-_UNDO_MAX]
+
+
+# ---------------------------------------------------------------------------
+# Shortcut firing: name -> keyboard binding -> real input.  See module notes.
+# ---------------------------------------------------------------------------
+KEYBOARD_PRESET = os.path.join(
+    os.path.expanduser("~"), "AppData", "Roaming", "Blackmagic Design",
+    "DaVinci Resolve", "Preferences", "keyboard.preset.xml")
+
+# Qt modifier bits, as stored in the preset's 4-byte key field.
+_QT_SHIFT, _QT_CTRL, _QT_ALT = 0x02000000, 0x04000000, 0x08000000
+_QT_META, _QT_KEYPAD = 0x10000000, 0x20000000
+
+# Windows virtual-key codes for the modifiers we can press.
+_VK_SHIFT, _VK_CTRL, _VK_ALT, _VK_LWIN = 0x10, 0x11, 0x12, 0x5B
+
+# Qt Key_* values that do NOT coincide with a Windows VK code. Letters and
+# digits do coincide (Qt::Key_A == 'A' == VK_A == 0x41), so they need no entry.
+_QT_TO_VK = {
+    0x01000000: 0x1B,  # Escape
+    0x01000001: 0x09,  # Tab
+    0x01000003: 0x08,  # Backspace
+    0x01000004: 0x0D,  # Return
+    0x01000005: 0x0D,  # Enter (keypad) -> same VK
+    0x01000006: 0x2D,  # Insert
+    0x01000007: 0x2E,  # Delete
+    0x01000010: 0x24,  # Home
+    0x01000011: 0x23,  # End
+    0x01000012: 0x25,  # Left
+    0x01000013: 0x26,  # Up
+    0x01000014: 0x27,  # Right
+    0x01000015: 0x28,  # Down
+    0x01000016: 0x21,  # PageUp
+    0x01000017: 0x22,  # PageDown
+    0x20: 0x20,        # Space
+}
+for _i in range(24):                      # F1..F24
+    _QT_TO_VK[0x01000030 + _i] = 0x70 + _i
+
+
+def _keyboard_bindings(path=None):
+    """command name -> raw 4-byte key field, parsed from the preset file.
+
+    The blob is a Qt hash-map serialization: big-endian length-prefixed UTF-16BE
+    strings, each followed by two constant fields then the key field. Bucket
+    ORDER changes on every save, so records are located by re-syncing on each
+    length prefix -- never by absolute offset.
+    """
+    import re as _re
+    import struct as _struct
+    path = path or KEYBOARD_PRESET
+    try:
+        with open(path, "r", encoding="utf-8") as _fh:
+            txt = _fh.read()
+    except Exception as e:
+        return None, {"error": "Could not read keyboard preset: %s" % e}
+    m = _re.search(r"<PresetListBA>([0-9a-fA-F]+)</PresetListBA>", txt)
+    if not m:
+        return None, {"error": "keyboard.preset.xml has no PresetListBA blob"}
+    b = bytes.fromhex(m.group(1))
+
+    out, i, n = {}, 0, len(b)
+    while i + 4 <= n:
+        L = _struct.unpack_from(">I", b, i)[0]
+        if 4 <= L <= 400 and L % 2 == 0 and i + 4 + L <= n:
+            try:
+                s = b[i + 4:i + 4 + L].decode("utf-16be", errors="strict")
+            except UnicodeDecodeError:
+                s = None
+            if s and s.strip() and all(32 <= ord(c) < 0x2500 for c in s):
+                fo = i + 4 + L + 8
+                if fo + 4 <= n and s not in out:
+                    out[s] = _struct.unpack_from(">I", b, fo)[0]
+                i += 4 + L
+                continue
+        i += 1
+    if not out:
+        return None, {"error": "Parsed no commands out of the keyboard preset"}
+    return out, None
+
+
+def _decode_binding(raw):
+    """4-byte key field -> (vk, [modifier vks], human label), or (None, ..., why)."""
+    if not raw:
+        return None, [], "unbound"
+    mods, labels = [], []
+    if raw & _QT_CTRL:
+        mods.append(_VK_CTRL); labels.append("Ctrl")
+    if raw & _QT_ALT:
+        mods.append(_VK_ALT); labels.append("Alt")
+    if raw & _QT_SHIFT:
+        mods.append(_VK_SHIFT); labels.append("Shift")
+    if raw & _QT_META:
+        mods.append(_VK_LWIN); labels.append("Meta")
+
+    base = raw & 0x00FFFFFF
+    if raw & _QT_KEYPAD and 0x30 <= base <= 0x39:
+        vk = 0x60 + (base - 0x30)          # VK_NUMPAD0..9
+        labels.append("Numpad%c" % base)
+    elif base in _QT_TO_VK:
+        vk = _QT_TO_VK[base]
+        labels.append("0x%x" % base)
+    elif 0x30 <= base <= 0x39 or 0x41 <= base <= 0x5A:
+        vk = base                          # digits and letters map 1:1
+        labels.append(chr(base))
+    else:
+        return None, [], "unmappable key value 0x%08x" % raw
+    return vk, mods, "+".join(labels)
+
+
+def _resolve_hwnd():
+    """Find Resolve's real main window. Never hardcode -- the handle changes
+    every launch, and a stale handle would send real keystrokes nowhere (or,
+    worse, to whatever inherited the number)."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    found = []
+
+    def proc_name(pid):
+        h = kernel32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return ""
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        ok = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        kernel32.CloseHandle(h)
+        return buf.value.split("\\")[-1].lower() if ok else ""
+
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            ln = user32.GetWindowTextLengthW(hwnd)
+            if ln > 0:
+                buf = ctypes.create_unicode_buffer(ln + 1)
+                user32.GetWindowTextW(hwnd, buf, ln + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                # Match the PROCESS, not the title: a title match would also hit
+                # the bridge's own console window ("DaVinci Resolve MCP Bridge").
+                if proc_name(pid.value) == "resolve.exe":
+                    found.append((hwnd, buf.value))
+        return True
+
+    user32.EnumWindows(CB(cb), 0)
+    if not found:
+        return None, None
+    # Prefer the real editing window over any transient splash/dialog.
+    for hwnd, title in found:
+        if "davinci resolve" in title.lower():
+            return hwnd, title
+    return found[0][0], found[0][1]
+
+
+def _send_keystroke(hwnd, vk, mod_vks):
+    """Foreground Resolve, then send REAL input. Returns (ok, detail)."""
+    import ctypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class _KB(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", PUL)]
+
+    class _MI(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong), ("dwExtraInfo", PUL)]
+
+    class _HI(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_ulong), ("wParamL", ctypes.c_short),
+                    ("wParamH", ctypes.c_ushort)]
+
+    class _II(ctypes.Union):
+        _fields_ = [("ki", _KB), ("mi", _MI), ("hi", _HI)]
+
+    class _INPUT(ctypes.Structure):
+        # All three variants must be declared: sizeof() must match the native
+        # INPUT struct (40 bytes on x64) or SendInput rejects every event on the
+        # size check. Declaring only the keyboard variant returned 0/4 accepted.
+        _fields_ = [("type", ctypes.c_ulong), ("ii", _II)]
+
+    def ev(v, up):
+        return _INPUT(1, _II(ki=_KB(v, 0, 0x0002 if up else 0, 0, None)))
+
+    fg_before = user32.GetForegroundWindow()
+    fg_tid = user32.GetWindowThreadProcessId(fg_before, None)
+    my_tid = kernel32.GetCurrentThreadId()
+    tgt_tid = user32.GetWindowThreadProcessId(hwnd, None)
+
+    user32.AttachThreadInput(my_tid, fg_tid, True)
+    user32.AttachThreadInput(my_tid, tgt_tid, True)
+    user32.ShowWindow(hwnd, 9)                       # SW_RESTORE if minimized
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    user32.AttachThreadInput(my_tid, fg_tid, False)
+    user32.AttachThreadInput(my_tid, tgt_tid, False)
+    time.sleep(0.05)
+
+    if user32.GetForegroundWindow() != hwnd:
+        # Refuse rather than fire blind: this is real input, and it would land
+        # in whatever window IS frontmost.
+        return False, {"error": "Could not bring Resolve to the foreground; "
+                                "refused to send input so it cannot land in "
+                                "the wrong window."}
+
+    seq = [ev(m, False) for m in mod_vks] + [ev(vk, False), ev(vk, True)] \
+        + [ev(m, True) for m in reversed(mod_vks)]
+    arr = (_INPUT * len(seq))(*seq)
+    sent = user32.SendInput(len(seq), arr, ctypes.sizeof(_INPUT))
+    if sent != len(seq):
+        return False, {"error": "SendInput accepted only %d of %d events"
+                                % (sent, len(seq))}
+    return True, {"events": sent}
+
+
+def action_shortcut_fire(body):
+    """Trigger a Resolve command by name, using its keyboard shortcut.
+
+    body: command  (e.g. "viewActiveWindowSelectionEffects"), or
+          key      (raw 4-byte Qt binding, for testing)
+          [list=true] to return matching command names instead of firing.
+
+    VISIBLE SIDE EFFECT: brings Resolve to the foreground and leaves it there.
+    Unlike every other verb here, this one interrupts what the user is doing.
+    """
+    bindings, err = _keyboard_bindings()
+    if err:
+        return err
+
+    cmd = body.get("command", "")
+    if body.get("list"):
+        q = cmd.lower()
+        hits = sorted(k for k in bindings if q in k.lower())
+        return {"query": cmd, "count": len(hits), "commands": hits[:200]}
+
+    if "key" in body:
+        raw, cmd = int(body["key"]), cmd or "(raw key)"
+    else:
+        if not cmd:
+            return {"error": "command is required (or pass list=true to search)"}
+        if cmd not in bindings:
+            near = sorted(k for k in bindings if cmd.lower() in k.lower())[:10]
+            return {"error": "No command named '%s'" % cmd, "didYouMean": near}
+        raw = bindings[cmd]
+
+    vk, mods, label = _decode_binding(raw)
+    if vk is None:
+        return {"error": "Command '%s' is %s -- nothing to fire. Assign it a "
+                         "shortcut in Resolve first." % (cmd, label),
+                "command": cmd, "binding": label}
+
+    hwnd, title = _resolve_hwnd()
+    if not hwnd:
+        return {"error": "Could not find a visible DaVinci Resolve window"}
+
+    t0 = time.time()
+    ok, detail = _send_keystroke(hwnd, vk, mods)
+    ms = (time.time() - t0) * 1000.0
+    if not ok:
+        detail.update({"command": cmd, "binding": label})
+        return detail
+    return {
+        "success": True, "command": cmd, "binding": label,
+        "window": title, "ms": round(ms), "events": detail.get("events"),
+        "note": "Resolve is now in the foreground and will stay there; "
+                "focus is not restorable (Windows limitation, tested).",
+    }
+
+
+def action_timeline_place(body):
+    """Place a pool clip at an exact track + frame.
+
+    body: mediaId|clip, trackIndex, recordFrame, frames, [srcIn=0],
+          [trackType=video]
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    item, err = _pool_item_by_ref(pool, body)
+    if err:
+        return err
+    frames = int(body.get("frames", 0))
+    if frames <= 0:
+        return {"error": "frames must be a positive count"}
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    rf = int(body.get("recordFrame", 0))
+    landed, err = _place(pool, item, tt, ti, rf, int(body.get("srcIn", 0)), frames)
+    if err:
+        return err
+    d = _describe(landed)
+    if not body.get("_isUndo"):
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/remove",
+                   {"trackType": tt, "trackIndex": ti, "atFrame": d["start"]})
+    return {
+        "success": True, "placed": d, "timeline": safe(lambda: tl.GetName()),
+        "frameExact": d["start"] == rf and d["duration"] == frames,
+    }
+
+
+def action_timeline_swap(body):
+    """Swap the media under an existing edit, holding its position and length.
+
+    There is no ReplaceClip on a TimelineItem, so this is delete + re-place at
+    the identical recordFrame. body: atFrame, trackIndex, mediaId|clip,
+    [trackType=video], [srcIn=0]
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    at = int(body.get("atFrame", -1))
+    if at < 0:
+        return {"error": "atFrame is required"}
+    target = _item_at_frame(tl, tt, ti, at)
+    if not target:
+        return {"error": "No clip at %s track %d frame %d" % (tt, ti, at)}
+    newsrc, err = _pool_item_by_ref(pool, body)
+    if err:
+        return err
+    before = _describe(target)
+    prior_src = safe(lambda: target.GetMediaPoolItem())
+    prior_media_id = safe(lambda: prior_src.GetMediaId()) if prior_src else None
+    prior_src_in = int(safe(lambda: target.GetLeftOffset()) or 0)
+    if not safe(lambda: tl.DeleteClips([target])):
+        return {"error": "Could not delete the existing clip; nothing changed"}
+    landed, err = _place(pool, newsrc, tt, ti, before["start"],
+                         int(body.get("srcIn", 0)), before["duration"])
+    if err:
+        return {"error": "Deleted the old clip but the replacement did not "
+                         "commit --- there is now a GAP at frame %d. %s"
+                         % (before["start"], err.get("error")),
+                "gapAt": before["start"], "lost": before}
+    after = _describe(landed)
+    if not body.get("_isUndo") and prior_media_id:
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/swap",
+                   {"trackType": tt, "trackIndex": ti, "atFrame": before["start"],
+                    "mediaId": prior_media_id, "srcIn": prior_src_in})
+    return {
+        "success": True, "before": before, "after": after,
+        "positionHeld": after["start"] == before["start"],
+        "durationHeld": after["duration"] == before["duration"],
+    }
+
+
+def action_timeline_move(body):
+    """Move a clip along its track. Delete + re-place; there is no move API.
+
+    body: fromFrame, toFrame, trackIndex, [trackType=video]
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    fr = int(body.get("fromFrame", -1))
+    to = int(body.get("toFrame", -1))
+    if fr < 0 or to < 0:
+        return {"error": "fromFrame and toFrame are required"}
+    target = _item_at_frame(tl, tt, ti, fr)
+    if not target:
+        return {"error": "No clip at %s track %d frame %d" % (tt, ti, fr)}
+    before = _describe(target)
+    src = safe(lambda: target.GetMediaPoolItem())
+    if not src:
+        return {"error": "That timeline item has no media pool source "
+                         "(compound/Fusion/title?) --- cannot move it this way"}
+    src_in = int(safe(lambda: target.GetLeftOffset()) or 0)
+    if not safe(lambda: tl.DeleteClips([target])):
+        return {"error": "Could not delete the clip; nothing changed"}
+    landed, err = _place(pool, src, tt, ti, to, src_in, before["duration"])
+    if err:
+        return {"error": "Deleted the clip but could not re-place it at %d. "
+                         "It is GONE from the timeline. %s" % (to, err.get("error")),
+                "lost": before}
+    if not body.get("_isUndo"):
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/move",
+                   {"trackType": tt, "trackIndex": ti, "fromFrame": to, "toFrame": fr})
+    return {"success": True, "from": before, "to": _describe(landed)}
+
+
+def action_timeline_remove(body):
+    """Remove the clip at a frame, leaving a gap. body: atFrame, trackIndex."""
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    at = int(body.get("atFrame", -1))
+    if at < 0:
+        return {"error": "atFrame is required"}
+    target = _item_at_frame(tl, tt, ti, at)
+    if not target:
+        return {"error": "No clip at %s track %d frame %d" % (tt, ti, at)}
+    d = _describe(target)
+    prior_src = safe(lambda: target.GetMediaPoolItem())
+    prior_media_id = safe(lambda: prior_src.GetMediaId()) if prior_src else None
+    prior_src_in = int(safe(lambda: target.GetLeftOffset()) or 0)
+    ok = safe(lambda: tl.DeleteClips([target]))
+    gone = _item_at_frame(tl, tt, ti, at) is None
+    if ok and gone and not body.get("_isUndo") and prior_media_id:
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/place",
+                   {"trackType": tt, "trackIndex": ti, "recordFrame": d["start"],
+                    "frames": d["duration"], "mediaId": prior_media_id,
+                    "srcIn": prior_src_in})
+    return {"success": bool(ok) and gone, "removed": d, "verifiedGone": gone}
+
+
+def action_timeline_undo(body):
+    """Reverse the last place/swap/move/remove call made through this bridge.
+
+    Refuses if the current timeline differs from the one the entry was
+    recorded on --- replaying a compensating edit on the wrong timeline would
+    itself be a silent corruption, so this asks you to switch back rather
+    than guess. The entry stays on the stack when refused, so a later retry
+    on the right timeline still works.
+    """
+    if not _UNDO_STACK:
+        return {"error": "Nothing to undo", "stackDepth": 0}
+    entry = _UNDO_STACK[-1]
+    _, _, tl, err = _timeline()
+    if err:
+        return err
+    current = safe(lambda: tl.GetName())
+    if entry["timeline"] != current:
+        return {"error": "Last recorded action was on timeline '%s', but '%s' "
+                         "is current. Switch back to undo it." % (entry["timeline"], current),
+                "recordedOn": entry["timeline"], "current": current}
+    _UNDO_STACK.pop()
+    fn = POST_ROUTES.get(entry["route"])
+    body2 = dict(entry["body"])
+    body2["_isUndo"] = True
+    result = fn(body2)
+    return {"undid": entry["route"], "of": entry["body"], "result": result,
+            "stackDepth": len(_UNDO_STACK)}
+
+
+def _snapshot_tracks(tl, track_type="video"):
+    """Record every clip on every track: enough to rebuild the layout exactly.
+
+    Items with no media pool source (nested compounds, titles, generators)
+    cannot be re-placed from a mediaId, so they are recorded but flagged --
+    a restore that silently dropped them would look like it worked.
+    """
+    clips, unrestorable = [], []
+    count = int(safe(lambda: tl.GetTrackCount(track_type)) or 0)
+    for ti in range(1, count + 1):
+        for it in (safe(lambda: tl.GetItemListInTrack(track_type, ti)) or []):
+            mpi = safe(lambda it=it: it.GetMediaPoolItem())
+            mid = safe(lambda: mpi.GetMediaId()) if mpi else None
+            rec = {
+                "trackType": track_type,
+                "trackIndex": ti,
+                "start": int(safe(lambda it=it: it.GetStart()) or 0),
+                "duration": int(safe(lambda it=it: it.GetDuration()) or 0),
+                "srcIn": int(safe(lambda it=it: it.GetLeftOffset()) or 0),
+                "mediaId": mid,
+                "name": safe(lambda it=it: it.GetName()),
+            }
+            (clips if mid else unrestorable).append(rec)
+    return clips, unrestorable
+
+
+def action_timeline_snapshot(body):
+    """Read-only record of the current layout. Also the unit merge-undo uses."""
+    _, _, tl, err = _timeline()
+    if err:
+        return err
+    tt = body.get("trackType", "video")
+    clips, unrestorable = _snapshot_tracks(tl, tt)
+    return {
+        "timeline": safe(lambda: tl.GetName()),
+        "trackType": tt,
+        "count": len(clips),
+        "clips": clips,
+        "unrestorable": unrestorable,
+        "fullyRestorable": not unrestorable,
+    }
+
+
+def action_timeline_restore(body):
+    """Rebuild a recorded layout. body: clips[], [clearFirst=true]
+
+    Used as the undo for a merge. Clears the target tracks first so the
+    compound clip left behind by the merge does not survive alongside the
+    restored originals.
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    clips = body.get("clips", [])
+    if not clips:
+        return {"error": "clips array is required"}
+
+    if body.get("clearFirst", True):
+        tracks = sorted({(c.get("trackType", "video"), int(c["trackIndex"])) for c in clips})
+        for tt, ti in tracks:
+            existing = list(safe(lambda: tl.GetItemListInTrack(tt, ti)) or [])
+            if existing:
+                safe(lambda e=existing: tl.DeleteClips(e))
+
+    by_id = _pool_items_by_ids(pool, [c["mediaId"] for c in clips if c.get("mediaId")])
+    placed, failed = 0, []
+    for c in sorted(clips, key=lambda x: (x["trackIndex"], x["start"])):
+        item = by_id.get(c.get("mediaId"))
+        if not item:
+            failed.append({"name": c.get("name"), "why": "media pool item is gone"})
+            continue
+        landed, e = _place(pool, item, c.get("trackType", "video"),
+                           int(c["trackIndex"]), int(c["start"]),
+                           int(c.get("srcIn", 0)), int(c["duration"]))
+        if e:
+            failed.append({"name": c.get("name"), "start": c["start"],
+                           "why": e.get("error")})
+        else:
+            placed += 1
+    return {"success": not failed, "restored": placed,
+            "requested": len(clips), "failed": failed}
+
+
+def action_timeline_merge(body):
+    """Collapse every video track into one compound clip -- reversibly.
+
+    Resolve exposes no un-nest and no Undo, so the ONLY thing that makes this
+    reversible is the snapshot taken here, before anything changes.
+    """
+    _, _, tl, err = _timeline()
+    if err:
+        return err
+    name = body.get("name", "MERGED")
+    clips, unrestorable = _snapshot_tracks(tl, "video")
+    if unrestorable and not body.get("force"):
+        return {"error": "%d item(s) on this timeline have no media pool source "
+                         "(nested compound / title / generator). They could NOT "
+                         "be rebuilt if you undo this merge. Pass force=true to "
+                         "merge anyway and accept that." % len(unrestorable),
+                "unrestorable": unrestorable}
+
+    items = []
+    for ti in range(1, int(safe(lambda: tl.GetTrackCount("video")) or 0) + 1):
+        items.extend(safe(lambda: tl.GetItemListInTrack("video", ti)) or [])
+    if not items:
+        return {"error": "No video clips to merge"}
+
+    result = safe(lambda: tl.CreateCompoundClip(items, {"name": name}))
+    if not result:
+        return {"error": "CreateCompoundClip failed; nothing changed"}
+
+    if not body.get("_isUndo"):
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/restore",
+                   {"clips": clips, "clearFirst": True})
+    return {"success": True, "merged": len(items),
+            "compound": safe(lambda: result.GetName()),
+            "undoable": True, "snapshotClips": len(clips)}
+
+
+def action_timeline_ripple_delete(body):
+    """Delete the clip at a frame and close the gap it leaves.
+
+    body: atFrame, trackIndex, [trackType=video]
+    Shifts every later clip on that track left by the removed duration.
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    at = int(body.get("atFrame", -1))
+    if at < 0:
+        return {"error": "atFrame is required"}
+
+    target = _item_at_frame(tl, tt, ti, at)
+    if not target:
+        return {"error": "No clip at %s track %d frame %d" % (tt, ti, at)}
+    removed = _describe(target)
+    shift = removed["duration"]
+    gap_start = removed["start"]
+    # Capture the source id NOW: after DeleteClips the TimelineItem handle is
+    # dead and GetMediaPoolItem() returns None, which previously meant the undo
+    # entry was silently never pushed and undo popped an unrelated action.
+    _tgt_mpi = safe(lambda: target.GetMediaPoolItem())
+    removed_media_id = safe(lambda: _tgt_mpi.GetMediaId()) if _tgt_mpi else None
+    removed_src_in = int(safe(lambda: target.GetLeftOffset()) or 0)
+    # Snapshot the WHOLE track for undo, not just the clips this verb touches:
+    # /timeline/restore clears the track before rebuilding, so a partial record
+    # would wipe untouched clips and never put them back (measured: the clip
+    # before the gap disappeared on undo).
+    _undo_track_snapshot = []
+    for _it in (safe(lambda: tl.GetItemListInTrack(tt, ti)) or []):
+        _mpi = safe(lambda _it=_it: _it.GetMediaPoolItem())
+        _mid = safe(lambda: _mpi.GetMediaId()) if _mpi else None
+        if _mid:
+            _undo_track_snapshot.append({
+                "trackType": tt, "trackIndex": ti,
+                "start": int(safe(lambda _it=_it: _it.GetStart()) or 0),
+                "duration": int(safe(lambda _it=_it: _it.GetDuration()) or 0),
+                "srcIn": int(safe(lambda _it=_it: _it.GetLeftOffset()) or 0),
+                "mediaId": _mid, "name": safe(lambda _it=_it: _it.GetName())})
+
+    # Record the followers BEFORE deleting anything -- their TimelineItem
+    # handles do not survive the delete.
+    later = []
+    for it in (safe(lambda: tl.GetItemListInTrack(tt, ti)) or []):
+        s = int(safe(lambda it=it: it.GetStart()) or 0)
+        if s > gap_start:
+            mpi = safe(lambda it=it: it.GetMediaPoolItem())
+            mid = safe(lambda: mpi.GetMediaId()) if mpi else None
+            if not mid:
+                return {"error": "Clip '%s' at %d has no media pool source, so it "
+                                 "cannot be shifted. Nothing was deleted."
+                                 % (safe(lambda it=it: it.GetName()), s)}
+            later.append({"mediaId": mid, "start": s,
+                          "duration": int(safe(lambda it=it: it.GetDuration()) or 0),
+                          "srcIn": int(safe(lambda it=it: it.GetLeftOffset()) or 0),
+                          "name": safe(lambda it=it: it.GetName())})
+
+    to_delete = [target] + [i for i in (safe(lambda: tl.GetItemListInTrack(tt, ti)) or [])
+                            if int(safe(lambda i=i: i.GetStart()) or 0) > gap_start]
+    if not safe(lambda: tl.DeleteClips(to_delete)):
+        return {"error": "Delete failed; nothing changed"}
+
+    by_id = _pool_items_by_ids(pool, [c["mediaId"] for c in later])
+    moved, failed = 0, []
+    for c in sorted(later, key=lambda x: x["start"]):      # leftmost first
+        item = by_id.get(c["mediaId"])
+        landed, e = _place(pool, item, tt, ti, c["start"] - shift,
+                           c["srcIn"], c["duration"]) if item else (None, {"error": "pool item gone"})
+        if e:
+            failed.append({"name": c["name"], "why": e.get("error")})
+        else:
+            moved += 1
+
+    if not body.get("_isUndo"):
+        if _undo_track_snapshot:
+            _push_undo(safe(lambda: tl.GetName()), "/timeline/restore",
+                       {"clips": _undo_track_snapshot, "clearFirst": True})
+
+    return {"success": not failed, "removed": removed, "closedGapOf": shift,
+            "shifted": moved, "failed": failed}
+
+
+def action_timeline_trim(body):
+    """Change a clip's duration in place. body: atFrame, trackIndex, frames.
+
+    Resolve has no trim API, so this is delete + re-place -- which produces a
+    NEW TimelineItem. Any Fusion comp (a fade, a flash) or colour work on the
+    old item is DESTROYED. This refuses when it detects that, rather than
+    quietly discarding work, which is exactly what happened earlier today when
+    an "extend" silently removed a fade that had just been requested.
+    """
+    _, proj, tl, err = _timeline()
+    if err:
+        return err
+    pool = proj.GetMediaPool()
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    at = int(body.get("atFrame", -1))
+    frames = int(body.get("frames", 0))
+    if at < 0 or frames <= 0:
+        return {"error": "atFrame and a positive frames count are required"}
+
+    target = _item_at_frame(tl, tt, ti, at)
+    if not target:
+        return {"error": "No clip at %s track %d frame %d" % (tt, ti, at)}
+    before = _describe(target)
+
+    n_comps = int(safe(lambda: target.GetFusionCompCount()) or 0)
+    versions = safe(lambda: target.GetVersionNameList(0)) or []
+    has_work = n_comps > 0 or len(versions) > 1
+    if has_work and not body.get("force"):
+        return {"error": "This clip carries %d Fusion comp(s) and %d colour "
+                         "version(s). Resolve has no trim API, so changing its "
+                         "length means rebuilding the clip and that work would "
+                         "be LOST. Nothing was changed. Pass force=true to "
+                         "proceed anyway." % (n_comps, len(versions)),
+                "clip": before, "fusionComps": n_comps,
+                "colorVersions": len(versions)}
+
+    src = safe(lambda: target.GetMediaPoolItem())
+    if not src:
+        return {"error": "That item has no media pool source; cannot rebuild it"}
+    src_in = int(safe(lambda: target.GetLeftOffset()) or 0)
+
+    if not safe(lambda: tl.DeleteClips([target])):
+        return {"error": "Delete failed; nothing changed"}
+    landed, e = _place(pool, src, tt, ti, before["start"], src_in, frames)
+    if e:
+        return {"error": "Deleted the clip but could not re-place it: %s. It is "
+                         "GONE from the timeline." % e.get("error"), "lost": before}
+
+    after = _describe(landed)
+    if not body.get("_isUndo"):
+        _push_undo(safe(lambda: tl.GetName()), "/timeline/trim",
+                   {"trackType": tt, "trackIndex": ti, "atFrame": before["start"],
+                    "frames": before["duration"], "force": True})
+    return {"success": True, "before": before, "after": after,
+            "exact": after["duration"] == frames,
+            "discardedFusionComps": n_comps if has_work else 0}
+
+
+def _resolve_is_running():
+    """True if any Resolve.exe is alive. Writing the keyboard preset while it
+    is would be pointless: Resolve rewrites that file from memory."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    arr = (wintypes.DWORD * 4096)()
+    got = wintypes.DWORD()
+    if not ctypes.windll.psapi.EnumProcesses(ctypes.byref(arr),
+                                             ctypes.sizeof(arr), ctypes.byref(got)):
+        return None                       # unknown -- caller must not assume safe
+    for i in range(got.value // ctypes.sizeof(wintypes.DWORD)):
+        pid = arr[i]
+        h = k32.OpenProcess(0x1000, False, pid)
+        if not h:
+            continue
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        ok = k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        k32.CloseHandle(h)
+        if ok and buf.value.split("\\")[-1].lower() == "resolve.exe":
+            return True
+    return False
+
+
+def action_keyboard_rebind(body):
+    """Rebind (or clear) a command's keyboard shortcut.
+
+    body: command, key (raw Qt value) | clear=true, [allowWhileRunning=false]
+
+    Only the 4-byte key field is touched -- no records are resized, so the
+    hash-map layout is untouched.
+    """
+    import re as _re
+    import struct as _struct
+
+    cmd = body.get("command", "")
+    if not cmd:
+        return {"error": "command is required"}
+    if "key" not in body and not body.get("clear"):
+        return {"error": "pass key (raw Qt value) or clear=true"}
+    new_val = 0 if body.get("clear") else int(body["key"])
+
+    running = _resolve_is_running()
+    if running is not False and not body.get("allowWhileRunning"):
+        return {"error": "DaVinci Resolve %s running. It rewrites "
+                         "keyboard.preset.xml from its in-memory copy, so an "
+                         "edit made now would be silently reverted (measured "
+                         "2026-07-22). Quit Resolve first."
+                         % ("appears to be" if running else "may be"),
+                "resolveRunning": running}
+
+    path = KEYBOARD_PRESET
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            txt = fh.read()
+    except Exception as e:
+        return {"error": "Could not read keyboard preset: %s" % e}
+    m = _re.search(r"<PresetListBA>([0-9a-fA-F]+)</PresetListBA>", txt)
+    if not m:
+        return {"error": "No PresetListBA blob in keyboard.preset.xml"}
+    blob = bytearray(bytes.fromhex(m.group(1)))
+
+    off, i, n = None, 0, len(blob)
+    while i + 4 <= n:
+        L = _struct.unpack_from(">I", blob, i)[0]
+        if 4 <= L <= 400 and L % 2 == 0 and i + 4 + L <= n:
+            try:
+                s = bytes(blob[i + 4:i + 4 + L]).decode("utf-16be", errors="strict")
+            except UnicodeDecodeError:
+                s = None
+            if s == cmd:
+                off = i + 4 + L + 8
+                break
+            if s and s.strip() and all(32 <= ord(c) < 0x2500 for c in s):
+                i += 4 + L
+                continue
+        i += 1
+    if off is None:
+        return {"error": "No command named '%s' in the preset" % cmd}
+
+    old_val = _struct.unpack_from(">I", blob, off)[0]
+    backup = path + ".bak-ambiguity"
+    try:
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(txt)
+    except Exception as e:
+        return {"error": "Refusing to write without a backup (%s)" % e}
+
+    _struct.pack_into(">I", blob, off, new_val)
+    out = txt[:m.start(1)] + bytes(blob).hex() + txt[m.end(1):]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(out)
+
+    with open(path, "r", encoding="utf-8") as fh:
+        check = fh.read()
+    cb = bytes.fromhex(_re.search(r"<PresetListBA>([0-9a-fA-F]+)</PresetListBA>", check).group(1))
+    now = _struct.unpack_from(">I", cb, off)[0]
+    _, _, old_label = _decode_binding(old_val)
+    _, _, new_label = _decode_binding(new_val)
+    return {"success": now == new_val, "command": cmd,
+            "was": "0x%08x (%s)" % (old_val, old_label),
+            "now": "0x%08x (%s)" % (now, new_label),
+            "backup": backup,
+            "note": "Resolve must be restarted to load this."}
+
+
+def action_timeline_read(body):
+    """Every clip on a track with its frame span --- the map you edit against."""
+    _, _, tl, err = _timeline()
+    if err:
+        return err
+    tt = body.get("trackType", "video")
+    ti = int(body.get("trackIndex", 1))
+    out = []
+    for it in (safe(lambda: tl.GetItemListInTrack(tt, ti)) or []):
+        d = _describe(it)
+        mpi = safe(lambda it=it: it.GetMediaPoolItem())
+        d["mediaId"] = safe(lambda: mpi.GetMediaId()) if mpi else None
+        d["end"] = int(safe(lambda it=it: it.GetEnd()) or 0)
+        out.append(d)
+    return {"timeline": safe(lambda: tl.GetName()), "trackType": tt,
+            "trackIndex": ti, "count": len(out), "clips": out}
 
 
 def action_append_to_timeline(body):
@@ -2258,6 +3359,51 @@ def action_add_fusion_comp(body):
     return {"success": True}
 
 
+def action_clip_fade(body):
+    """Fusion-based fade from/to black on a clip via a keyframed BrightnessContrast Gain.
+    body: trackType, trackIndex, clipIndex, direction ('in'|'out'), frames (int).
+    Native keyframes/transitions aren't in the Resolve API; Fusion is the scriptable path."""
+    item, err = _clip_at(body)
+    if err:
+        return err
+    direction = str(body.get("direction", "in")).lower()
+    frames = max(1, int(body.get("frames", 30)))
+    comp = safe(lambda: item.GetFusionCompByIndex(1)) or safe(lambda: item.AddFusionComp())
+    if not comp:
+        return {"error": "Could not get or create a Fusion comp on this clip"}
+    mi = safe(lambda: comp.FindTool("MediaIn1"))
+    mo = safe(lambda: comp.FindTool("MediaOut1"))
+    if not mi or not mo:
+        return {"error": "MediaIn1/MediaOut1 not found in comp"}
+    attrs = safe(lambda: comp.GetAttrs()) or {}
+    gstart = int(attrs.get("COMPN_GlobalStart", 0))
+    gend = int(attrs.get("COMPN_GlobalEnd", gstart + frames))
+    comp.StartUndo("clip fade %s" % direction)
+    bc = comp.AddTool("BrightnessContrast")
+    bc.Input = mi            # MediaIn -> BC   (attribute-style; ConnectInput no-ops on this build)
+    mo.Input = bc            # BC -> MediaOut
+    bc.AddModifier("Gain", "BezierSpline")
+    if direction == "out":
+        f0, v0, f1, v1 = gend - frames + 1, 1.0, gend, 0.0
+    else:
+        f0, v0, f1, v1 = gstart, 0.0, gstart + frames - 1, 1.0
+    bc.SetInput("Gain", v0, float(f0))
+    bc.SetInput("Gain", v1, float(f1))
+    comp.EndUndo(True)
+    fm = (f0 + f1) // 2
+    return {
+        "success": True,
+        "clip": safe(lambda: item.GetName()),
+        "direction": direction, "frames": frames,
+        "globalStart": gstart, "globalEnd": gend,
+        "gainCurve": {
+            str(f0): safe(lambda: bc.GetInput("Gain", float(f0))),
+            str(fm): safe(lambda: bc.GetInput("Gain", float(fm))),
+            str(f1): safe(lambda: bc.GetInput("Gain", float(f1))),
+        },
+    }
+
+
 def action_import_fusion_comp(body):
     item, err = _clip_at(body)
     if err:
@@ -3030,6 +4176,19 @@ POST_ROUTES = {
     "/media/import":                action_import_media,
     "/media/import-storage":        action_import_media_from_storage,
     "/media/append":                action_append_to_timeline,
+    "/timeline/place":              action_timeline_place,
+    "/timeline/swap":               action_timeline_swap,
+    "/timeline/move":               action_timeline_move,
+    "/timeline/remove":             action_timeline_remove,
+    "/timeline/undo":               action_timeline_undo,
+    "/timeline/read":               action_timeline_read,
+    "/shortcut/fire":               action_shortcut_fire,
+    "/timeline/snapshot":           action_timeline_snapshot,
+    "/timeline/restore":            action_timeline_restore,
+    "/timeline/merge":              action_timeline_merge,
+    "/timeline/ripple-delete":      action_timeline_ripple_delete,
+    "/timeline/trim":               action_timeline_trim,
+    "/keyboard/rebind":             action_keyboard_rebind,
     "/media/insert":                action_insert_to_timeline,
     # media pool deep access
     "/mediapool/navigate":          action_navigate_media_pool,
@@ -3078,6 +4237,7 @@ POST_ROUTES = {
     "/color/group/remove":          action_remove_from_color_group,
     # fusion comps per-clip
     "/clip/fusion/add":             action_add_fusion_comp,
+    "/clip/fade":                   action_clip_fade,
     "/clip/fusion/import":          action_import_fusion_comp,
     "/clip/fusion/export":          action_export_fusion_comp,
     "/clip/fusion/delete":          action_delete_fusion_comp,
@@ -3195,10 +4355,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         handler = GET_ROUTES.get(path)
         if handler:
-            try:
-                self._respond(handler(qs))
-            except Exception:
-                self._error(500, traceback.format_exc())
+            result, err = _call_with_timeout(path, handler, qs)
+            if err:
+                self._error(504, err["error"])
+            else:
+                self._respond(result)
         else:
             self._error(404, "Unknown GET endpoint: %s" % path)
 
@@ -3217,10 +4378,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         handler = POST_ROUTES.get(path)
         if handler:
-            try:
-                self._respond(handler(body))
-            except Exception:
-                self._error(500, traceback.format_exc())
+            result, err = _call_with_timeout(path, handler, body)
+            if err:
+                self._error(504, err["error"])
+            else:
+                self._respond(result)
         else:
             self._error(404, "Unknown POST endpoint: %s" % path)
 
@@ -3248,12 +4410,28 @@ try:
 except Exception:
     pass
 
+def _log_startup_crash(exc_text):
+    """Persist a startup traceback to disk. The Resolve console window vanishes on
+    an unhandled crash, so without this the failure is invisible."""
+    try:
+        crash_path = os.path.join(_BASE_DIR, "logs", "cursorbridge_startup_error.log")
+        os.makedirs(os.path.dirname(crash_path), exist_ok=True)
+        with open(crash_path, "a", encoding="utf-8") as f:
+            f.write("%s\n%s\n%s\n" % (
+                datetime.now().isoformat(timespec="seconds"),
+                "Python %s" % sys.version.replace("\n", " "),
+                exc_text))
+    except Exception:
+        pass
+
+
 print("[CursorBridge] Starting HTTP server on http://%s:%d ..." % (HOST, PORT))
 server = None
 try:
-    server = HTTPServer((HOST, PORT), BridgeHandler)
-    print("[CursorBridge] Bridge is running (read + write).  %d GET routes, %d POST routes." % (
-        len(GET_ROUTES), len(POST_ROUTES)))
+    server = ThreadingHTTPServer((HOST, PORT), BridgeHandler)
+    server.daemon_threads = True  # threads die with the process; no hang-on-exit
+    print("[CursorBridge] Bridge is running (read + write, hardened: threaded + %ss call timeout).  %d GET routes, %d POST routes." % (
+        RESOLVE_CALL_TIMEOUT, len(GET_ROUTES), len(POST_ROUTES)))
     print("[CursorBridge] To stop: close DaVinci Resolve or re-run this script.")
     server.serve_forever()
 except OSError as e:
@@ -3262,7 +4440,9 @@ except OSError as e:
         print("[CursorBridge] Restart DaVinci Resolve and try again.")
     else:
         print("[CursorBridge] ERROR: %s" % e)
+        _log_startup_crash(traceback.format_exc())
 except KeyboardInterrupt:
     print("[CursorBridge] Shutting down.")
 except Exception as e:
     print("[CursorBridge] ERROR: %s" % e)
+    _log_startup_crash(traceback.format_exc())
