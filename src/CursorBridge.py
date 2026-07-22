@@ -471,6 +471,38 @@ def gather_clip_flags(qs):
     return {"clipName": safe(lambda: item.GetName()), "flags": flags}
 
 
+def gather_clip_properties(qs):
+    """Get transform/compositing properties of a timeline item.
+
+    AMBIGUITY PATCH: the MCP layer's get_clip_properties GETs /clip/properties, but that
+    path was only registered for POST (set_clip_properties), so the read side never
+    existed and every call returned "Unknown GET endpoint". Without this there is no way
+    to verify a transform independently of the tool that set it.
+    """
+    _, _, tl, err = _timeline()
+    if err:
+        return err
+    tt = qs.get("track_type", ["video"])[0]
+    ti = int(qs.get("track_index", ["1"])[0])
+    ci = int(qs.get("clip_index", ["0"])[0])
+    items = safe(lambda: tl.GetItemListInTrack(tt, ti))
+    if not items:
+        return {"error": "No clips on %s track %d" % (tt, ti)}
+    if ci < 0 or ci >= len(items):
+        return {"error": "clipIndex %d out of range (0-%d)" % (ci, len(items) - 1)}
+    item = items[ci]
+    props = safe(lambda: item.GetProperty())
+    if props is None:
+        return {"error": "Resolve returned no properties for this clip"}
+    return {
+        "clipName": safe(lambda: item.GetName()),
+        "trackType": tt,
+        "trackIndex": ti,
+        "clipIndex": ci,
+        "properties": props,
+    }
+
+
 def gather_current_video_item(qs):
     """Get the current video item at the playhead."""
     _, _, tl, err = _timeline()
@@ -2634,6 +2666,7 @@ GET_ROUTES = {
     "/mediapool/clip/info":     gather_clip_info,
     "/clip/markers":            gather_clip_markers,
     "/clip/flags":              gather_clip_flags,
+    "/clip/properties":         gather_clip_properties,
     "/clip/node-graph":         gather_node_graph,
     "/clip/color-versions":     gather_color_versions,
     "/clip/fusion-comps":       gather_fusion_comps,

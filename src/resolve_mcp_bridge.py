@@ -419,6 +419,33 @@ def set_clip_color(
 
 
 @mcp.tool()
+def clip_fade(
+    track_type: str, track_index: int, clip_index: int,
+    direction: str = "in", frames: int = 30
+) -> Dict[str, Any]:
+    """Fade a clip up from black, or down to black, over a number of frames.
+
+    AMBIGUITY PATCH: the /clip/fade route existed in CursorBridge but was never exposed
+    as an MCP tool, so this capability was unreachable.
+
+    Resolve's API has no native keyframes or transitions, so this works by building a
+    keyframed BrightnessContrast Gain curve in a Fusion comp on the clip. The response
+    includes a 'gainCurve' sampled at the start, middle and end frames - check it goes
+    0 -> 1 (in) or 1 -> 0 (out) to confirm the ramp really exists.
+
+    Args:
+        track_type: 'video', 'audio', or 'subtitle'.
+        track_index: 1-based track index.
+        clip_index: 0-based clip position on that track.
+        direction: 'in' to fade up from black, 'out' to fade down to black.
+        frames: Length of the fade in frames (default 30 = 1s at 30fps)."""
+    return _post("/clip/fade", {
+        "trackType": track_type, "trackIndex": track_index,
+        "clipIndex": clip_index, "direction": direction, "frames": frames,
+    })
+
+
+@mcp.tool()
 def set_clip_enabled(
     track_type: str, track_index: int, clip_index: int, enabled: bool
 ) -> Dict[str, Any]:
@@ -445,7 +472,9 @@ def set_clip_properties(
         track_index: 1-based track index.
         clip_index: 0-based clip position on that track.
         properties: Dict of property key-value pairs. Supported keys include:
-            'Pan', 'Tilt' (float), 'ZoomX', 'ZoomY' (0-100),
+            'Pan', 'Tilt' (float),
+            'ZoomX', 'ZoomY' (SCALE FACTOR, not percent: 1.0 = 100%, 0.5 = 50%.
+                Verified on Resolve 21: passing 50 is accepted literally and means 5000%),
             'RotationAngle' (-360 to 360), 'Opacity' (0-100),
             'CropLeft', 'CropRight', 'CropTop', 'CropBottom' (float),
             'FlipX', 'FlipY' (bool), 'Distortion' (-1 to 1),
