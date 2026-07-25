@@ -110,6 +110,25 @@ Practical consequence: **a timeline carrying mix state cannot be round-tripped t
 Resolve's OTIO without losing it** — and custom metadata is not a workaround, because
 it does not survive either.
 
+### AAF has no track-scope destination either
+
+`reference-exports/aaf/T45_twoclip_control.aaf` is a two-clip audio track — clip A at
+**−20 dB**, clip B at **0 dB**. `worked-mutations/mut_aaf_trackscope_gain.aaf` is that
+same file with one `Audio Gain` of **0.5 (−6.02 dB)** hoisted (pyaaf2) to wrap the
+entire Sequence, i.e. a track-scope gain outside a clip-scope gain.
+
+On import Resolve gives **both** clips `volume = -6.0206` — exactly `20·log10(0.5)` —
+and clip A's **−20 dB is gone**. Measured against the control: **+14.00 dB** over
+1–14 s (model predicts +13.98) and **−6.00 dB** over 16–29 s (predicts −6.02).
+
+So track scope **collapses to clip scope** on import; there is no track-level
+destination.
+
+**⚠️ Import hazard worth knowing outside this project: nested `Audio Gain` groups lose
+the inner value.** A third-party AAF carrying clip gain inside a track or bus gain
+arrives with the clip gain silently replaced by the outer one. Check before trusting
+any incoming AAF's levels.
+
 ## Other files
 
 - `title_saved.comp` — Fusion title comp extracted via `export_fusion_comp_from_clip`.
