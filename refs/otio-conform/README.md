@@ -17,6 +17,26 @@ Captured from project `FCPXML test` (Resolve Studio 21.0.2.4, bridge 2.1.0),
 | `ref4_retime_50pct.otio` | **retime shape** — `LinearTimeWarp.1` / `time_scalar`, a **standard OTIO schema outside the `Resolve_OTIO` block**. Note `Retime and Scaling` (Type 22) stays `"Parameters": []` even here |
 | `ref5_speedramp_stepped.otio` | **speed ramp** — `TimeEffect.1`, keyframes of `[timeline_s, source_s, smooth?, in_x, in_y, out_x, out_y]` |
 | `ref6_speedramp_eased.otio` | **eased ramp** — the same, with cubic Bezier tangent handles populated. Slope `dy/dx` is the instantaneous speed |
+| `ref7_clip_audio_params.otio` | **every Fairlight clip parameter** — pan, pitch, EQ band and an audio fade handle, all set off-default so their IDs serialise |
+
+### Fairlight clip parameters — IDs, types and units
+
+| effect | Type | Parameter ID | type | range | unit trap |
+|---|---|---|---|---|---|
+| Clip Volume and Fades | 62 | `volume` | Double | −100 … 30 | dB |
+| | | `faderOut` | Double | 0 … 2^31 | **frames** — not seconds, not dB |
+| Clip Pan | 72 | `pan` | Double | −100 … 100 | negative = left |
+| Clip Pitch | 67 | `semiTones` | Int | −24 … 24 | |
+| Equaliser Band | 63 | `eq band index` | Int | −1 … 5 | six slots; index is its own default |
+| | | `eq frequency` | Int | 20 … 19000 | Hz |
+| | | `eq dB gain` | Int | −700 … 240 | **tenths of a dB** — 79 = +7.9 dB |
+| | | `eq qFactor` | Int | 300 … 100000 | **thousandths** — 750 = Q 0.75 |
+
+Measured, not just read back: `pan: -50` gives **L−R = +9.50 dB** where the control
+measures exactly 0.00; `faderOut: 427` gives tail decay of **−10.5 dB** then
+**−17.6 dB**, beginning exactly where 427 frames at 50 fps predicts. `semiTones` and
+the EQ values are read-back only so far. `faderIn` and a `cents` parameter are
+inferred, not observed — set each once rather than guessing the spelling.
 
 ## worked-mutations/ — authored by hand, all verified applied
 
