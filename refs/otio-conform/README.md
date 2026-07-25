@@ -91,6 +91,25 @@ clip that is demonstrably retimed, because the speed lives in a standard
 `Resolve_OTIO` block is what produced the wrong "retime is UI-only" call. **Dump the
 clip's whole JSON before declaring anything unauthorable.**
 
+## Track state — an adapter limit, not a format limit
+
+Say which layer a claim is about. **OTIO the format** gives every track an open
+`metadata` dict and can carry arbitrary serialisable state. **Resolve's OTIO adapter**
+is the actual constraint, and it is stricter than it looks:
+
+- It writes exactly `{"Audio Type", "Locked", "SoloOn"}` on an audio track — including
+  when `Locked`/`SoloOn` hold their default `false`. A fixed key set, with no volume in
+  it. A track carrying a genuinely non-default **+0.2 dB** fader still exported those
+  three keys and nothing more.
+- It **discards unknown keys on import.** Eight spellings (`Volume`, `Fader`, `Level`,
+  `Gain`, `Track Volume`, `Track Level`, `volume`, `fader`) injected at −20.0 came back
+  from a re-export completely absent, and the render measured **+0.00 dB in 3/3
+  windows** against the control.
+
+Practical consequence: **a timeline carrying mix state cannot be round-tripped through
+Resolve's OTIO without losing it** — and custom metadata is not a workaround, because
+it does not survive either.
+
 ## Other files
 
 - `title_saved.comp` — Fusion title comp extracted via `export_fusion_comp_from_clip`.
