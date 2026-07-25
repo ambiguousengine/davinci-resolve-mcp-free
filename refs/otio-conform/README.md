@@ -25,6 +25,34 @@ Captured from project `FCPXML test` (Resolve Studio 21.0.2.4, bridge 2.1.0),
 | `torture_placeholder.otio` | title → real-media placeholder | import succeeds where the original hard-fails |
 | `torture_full_flow.otio` | placeholder + authored 50 f video fade | title pixel-identical AND fade applied (ratio 0.4842 vs 0.5 predicted) |
 
+## reference-exports/aaf/ — Resolve's own AAF export (added 25 Jul)
+
+| file | what it shows |
+|---|---|
+| `T06_clipvol_minus20.aaf` | **constant clip gain** — `Audio Gain` → `ConstantValue` `Amplitude`, **linear** rational. −20 dB → `53687091/536870912` = 0.100000, exact |
+| `T07_duck_keyframed.aaf` | **keyframed clip gain** — `Audio Gain` → `VaryingValue` `Amplitude` + `PointList`. Time is **normalised 0..1** over the segment; values are linear |
+| `T20_AAFimport_duck.otio` | the same duck after `AAF → Resolve → OTIO`. Proves Resolve **imports** the automation. Note interior keyframes land **one frame early** (250/300/900/950 → 249/299/899/949), and `videoFaderOut` is **gone** |
+
+Verified by measurement, not read-back: rendered and `ffmpeg volumedetect` per window
+against the matched control — **+10.0 / −5.0 / +10.0 dB, 3/3 windows exact**.
+
+## tools/
+
+| file | what it does |
+|---|---|
+| `dump_aaf.py` | walks an AAF's mobs and slots, printing every `ConstantValue` / `VaryingValue` parameter and its control points. This is the reader the conform lane needs — `reel-forge/tools/aaf_audio.py` cannot open a Resolve AAF at all (it dies resolving *linked* essence long before it reaches `clip_gain()`) |
+| `otio_effects.py` | prints every **non-default** effect parameter per clip. Effects live at `clip["effects"][n]["metadata"]["Resolve_OTIO"]` — **not** on the clip's own metadata block, which is the easy place to look and find nothing |
+| `bridge.py` | 20-line HTTP client for the bridge. Use it rather than curl: Windows paths do not survive JSON quoting through a shell, and the MCP wrapper's argument names drift from the HTTP routes (`file_name` vs `fileName`) |
+
+## The other thing to remember
+
+**Resolve only serialises a parameter once it has been moved off its default in the
+UI.** `Fairlight Clip Pan` (72), `Pitch` (67), `Equaliser` (64) and `Retime and
+Scaling` (22) all export as `"Parameters": []` on a clean clip — present, `Enabled`,
+and unauthorable. `GetProperty()` on an audio item returns `{}`, so the live API is no
+help either. Every new verb therefore costs exactly one UI gesture: set it once,
+export, read the ID, author freely from then on.
+
 ## Other files
 
 - `title_saved.comp` — Fusion title comp extracted via `export_fusion_comp_from_clip`.
