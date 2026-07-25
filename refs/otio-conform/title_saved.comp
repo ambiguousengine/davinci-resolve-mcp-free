@@ -1,0 +1,79 @@
+Composition {
+	CurrentTime = 0,
+	RenderRange = { 0, 249 },
+	GlobalRange = { 0, 249 },
+	CurrentID = 3,
+	HiQ = true,
+	PlaybackUpdateMode = 0,
+	StereoMode = false,
+	Version = "DaVinci Resolve Studio 21.0.2.0004",
+	SavedOutputs = 0,
+	HeldTools = 0,
+	DisabledTools = 0,
+	LockedTools = 0,
+	AudioOffset = 0,
+	Resumable = true,
+	OutputClips = {
+	},
+	CustomData = {
+		TEMPLATE_ID = "Text+"
+	},
+	Tools = {
+		Template = TextPlus {
+			Inputs = {
+				GlobalOut = Input { Value = 249, },
+				Width = Input { Value = 1920, },
+				Height = Input { Value = 1080, },
+				UseFrameFormatSettings = Input { Value = 1, },
+				StyledText = Input { Value = "Custom Title", },
+				Font = Input { Value = "Open Sans", },
+				Style = Input { Value = "Semibold", },
+				Size = Input { Value = 0.09, },
+				VerticalJustificationNew = Input { Value = 3, },
+				HorizontalJustificationNew = Input { Value = 3, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 220, 49.5 } },
+		},
+		MediaOut1 = Saver {
+			Inputs = {
+				Index = Input { Value = "0", },
+				Input = Input {
+					SourceOp = "Template",
+					Source = "Output",
+				}
+			},
+			ViewInfo = OperatorInfo { Pos = { 440, 49.5 } },
+		}
+	},
+	Frames = {
+	},
+	Prefs = {
+		Comp = {
+			Interactive = {
+				Proxy = {
+					Scale = 1,
+				},
+			},
+			Views = {
+				View1 = {
+				},
+			},
+			Paths = {
+				Map = {
+				},
+			},
+			FrameFormat = {
+				Rate = 50,
+				GuideRatio = 1.77777777777778,
+				DepthFull = 3,
+				DepthPreview = 3,
+				DepthInteractive = 3,
+			},
+			Unsorted = {
+				GlobalEnd = 249
+			},
+			SpellCheck = {
+			},
+		}
+	},
+}
