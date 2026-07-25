@@ -1,7 +1,7 @@
 """apply_edit -- replay an intent ledger from a pinned base into a new Resolve version.
 
     from apply_edit import Pipeline
-    p = Pipeline("Fall Prevention - TEST SEQUENCE")     # pins the base
+    p = Pipeline("My Locked Cut v3")     # pins the base
     p.add("set_volume",   track=1, at=125,  db=-20)
     p.add("set_crop",     track=1, at=2878, top=0.25, bottom=0.25)
     print(p.apply(slug="mix_pass").report())

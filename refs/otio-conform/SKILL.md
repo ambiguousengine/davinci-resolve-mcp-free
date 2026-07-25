@@ -1,6 +1,6 @@
 # SKILL — Edit a locked DaVinci Resolve timeline by intent
 
-**Trigger this when Navigator asks for a change to an existing Resolve cut** — however
+**Trigger this when the user asks for a change to an existing Resolve cut** — however
 phrased: *"drop the music under the VO"*, *"make that dissolve longer"*, *"punch in on
 that shot"*, *"fade the end card"*, *"take 6 dB off the bed"*, *"crop the top off shot 4"*,
 *"halve the speed on that clip"*.
@@ -23,7 +23,7 @@ and undo is switching version and deleting.
 
 ## Before you touch anything
 
-1. **Bridge up.** `get_resolve_status` → `connected: true`. If not, ask Navigator to run
+1. **Bridge up.** `get_resolve_status` → `connected: true`. If not, ask the user to run
    the CursorBridge script inside Resolve (Workspace ▸ Scripts ▸ CursorBridge).
 2. **Right project open.** `get_project_list` / `load_project`.
 3. **Read the base's name exactly.** Timeline names are matched literally.
@@ -34,7 +34,7 @@ and undo is switching version and deleting.
 import sys; sys.path.insert(0, r"F:\AMBIGUITY\TOOLS\davinci-bridge\refs\otio-conform\tools")
 from apply_edit import Pipeline
 
-p = Pipeline("Fall Prevention - TEST SEQUENCE")      # pins the base, read-only
+p = Pipeline("My Locked Cut v3")      # pins the base, read-only
 p.add("set_volume",     track=1, at=125,  db=-12)    # `at` = TIMELINE FRAME
 p.add("set_crop",       track=1, at=2878, top=0.2, bottom=0.2)
 p.add("set_video_fade", track=1, at=5579, out_frames=40)
@@ -50,7 +50,7 @@ p.revise(0, db=-6).apply(slug="quieter").verify()
 
 ### Always
 
-- **Show Navigator the receipt.** It names the base, the pre-flight verdict, the intent
+- **Show the user the receipt.** It names the base, the pre-flight verdict, the intent
   count, and whether every value actually landed.
 - **`.verify()` before reporting success.** The import returns success even when it
   silently discards parameters. `verify()` re-exports and re-reads what Resolve actually
@@ -113,7 +113,7 @@ be neither started nor deleted and poisons the queue for everything after it.
   **exactly one static title**. Multiple and animated titles are untested. Wiring an
   unproven path to a real lock is the damage this pipeline exists to prevent.
 - **Compound clips are fine** — proven to round-trip with contents intact.
-- `force=True` overrides a RED. Only use it after telling Navigator precisely what is
+- `force=True` overrides a RED. Only use it after telling the user precisely what is
   being overridden and getting a yes.
 
 ## What the round trip costs, every time
@@ -123,10 +123,10 @@ be neither started nor deleted and poisons the queue for everything after it.
 - **Timeline mark in/out is cleared.**
 - **Grades are destroyed** — see the colour note above.
 
-## The one way Navigator loses work
+## The one way the user loses work
 
 **Hand-tweaking inside a generated version, then letting a replay run over it.** The
-replay rebuilds from base and the hand work is gone. If Navigator has touched a generated
+replay rebuilds from base and the hand work is gone. If the user has touched a generated
 version, call `p.rebaseline()` first — it pins that version as the new base and clears the
 ledger. **Say this out loud when handing back a version.**
 
