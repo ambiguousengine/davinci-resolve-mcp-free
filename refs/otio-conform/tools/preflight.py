@@ -160,9 +160,15 @@ def scan(path):
         print("            [WARN] UNTESTED -- every verified test used a SINGLE source file.")
 
     if len(out["source_rates"]) > 1:
-        print("            [STOP] MIXED SOURCE RATES: %s"
+        # NOT a blocker. Mixed source rates are normal in real editorial and Resolve
+        # conforms them on import; calling this RED made the first real timeline fail
+        # for a non-reason, and a tool that cries wolf gets ignored. The risk is narrow
+        # and specific: retime/ramp maths assume the clip's own timebase.
+        print("            [WARN] MIXED SOURCE RATES: %s"
               % ", ".join(str(r) for r in sorted(out["source_rates"])))
-        print("               Never tested. Retime and ramp maths assume one timebase.")
+        print("               Normal in a real cut -- Resolve conforms them. NOT a blocker.")
+        print("               Narrow risk: do not author a RETIME or RAMP on an off-rate")
+        print("               clip without measuring it -- every ramp test used one timebase.")
 
     # ── effects actually in use ──────────────────────────────────────────────
     print("\nEFFECTS IN USE (non-default parameters only)")
@@ -225,11 +231,11 @@ def scan(path):
 
     # ── verdict ──────────────────────────────────────────────────────────────
     print("\n" + "-" * 74)
-    if out["blockers"] or out["nested_stacks"] or len(out["source_rates"]) > 1:
+    if out["blockers"] or out["nested_stacks"]:
         print("VERDICT  [STOP] RED -- do NOT round-trip this timeline yet.")
         print("         Resolve the items above first. A silent failure here damages a lock.")
         rc = 2
-    elif out["unknown_schemas"] or len(out["media"]) > 1 or any(
+    elif out["unknown_schemas"] or len(out["media"]) > 1 or len(out["source_rates"]) > 1 or any(
             e not in PROVEN_EFFECTS for e in out["effects_in_use"]):
         print("VERDICT  [WARN] AMBER -- round trip is probably fine, but this timeline contains")
         print("         things no test has covered. Verify against a reference render, and")
@@ -244,11 +250,77 @@ def scan(path):
     return rc
 
 
+def video_spans(doc):
+    """[(track_index, start, end, name)] per VIDEO track, gaps consumed, transitions skipped."""
+    out = []
+    ti = 0
+    for tr in doc["tracks"]["children"]:
+        if tr.get("kind") != "Video":
+            continue
+        ti += 1
+        pos = 0
+        for ch in tr.get("children", []):
+            schema = str(ch.get("OTIO_SCHEMA", "")).split(".")[0]
+            dur = ((ch.get("source_range") or {}).get("duration") or {}).get("value") or 0
+            if schema == "Transition":
+                continue
+            if schema != "Gap":
+                out.append((ti, pos, pos + dur, ch.get("name")))
+            pos += dur
+    return out
+
+
+def clear_frames(path, track=1, min_len=0, tail=False, fps=25.0, start_tc_hour=1):
+    """Frames where `track` is visible -- i.e. NO higher video track covers it.
+
+    THIS EXISTS BECAUSE MEASURING A HIDDEN FRAME PRODUCES A FALSE NEGATIVE. Three
+    separate 'the verb is broken' conclusions on 25 Jul were all this: the sample point
+    was behind an upper layer, so control and edited rendered identically and the ratio
+    came back exactly 1.0000. Always resolve a sample frame through here first.
+    """
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    spans = video_spans(doc)
+    mine = [s for s in spans if s[0] == track]
+    upper = [s for s in spans if s[0] > track]
+
+    def covered(f):
+        return any(a <= f < b for _, a, b, _ in upper)
+
+    rows = []
+    for _, a, b, name in mine:
+        if b - a < min_len:
+            continue
+        window = range(int(b) - 60, int(b)) if tail else [int((a + b) // 2)]
+        if any(covered(f) for f in window):
+            continue
+        f = int(b) - 25 if tail else int((a + b) // 2)
+        total = int(f / fps)
+        rows.append((name, int(a), int(b), f,
+                     "%02d:%02d:%02d:%02d" % (start_tc_hour, total // 60, total % 60,
+                                              int(f % fps))))
+    return rows
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
         print(__doc__)
         sys.exit(3)
+    if args[0] == "--clear":
+        # preflight.py --clear <file.otio> [track] [--tail]
+        f = args[1]
+        trk = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
+        tail = "--tail" in args
+        rows = clear_frames(f, track=trk, tail=tail)
+        print("V%d frames with NO upper-track coverage (%s):"
+              % (trk, "last 60f of each clip" if tail else "clip midpoints"))
+        if not rows:
+            print("  none -- every clip on this track is covered there.")
+            print("  Measure on a higher track, or disable the covering track first.")
+        for name, a, b, fr, tc in rows:
+            print("  %-40s %6d-%-6d  sample frame %6d  = %s" % (str(name)[:40], a, b, fr, tc))
+        sys.exit(0 if rows else 1)
     if args[0] == "--export":
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from bridge import call                                  # noqa: E402
