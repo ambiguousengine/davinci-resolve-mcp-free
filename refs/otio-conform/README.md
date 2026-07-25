@@ -200,3 +200,13 @@ pixel. `.drx`, `copy_grades` and `reset_all_grades` are **byte-identical**.
 ⚠️ **`set_lut` refuses an arbitrary absolute path.** Copy the `.cube` into Resolve's
 `Support\LUT` folder → `refresh_lut_list()` → pass the **bare filename**.
 ⚠️ **`export_current_frame` fails on the Deliver page** — open **Color** first.
+
+---
+
+## Where the operating skill lives
+
+`SKILL.md` used to sit here. It has been moved to the **private** `ambiguity-docs` repo
+(`_docs/RESOLVE-CONFORM-SKILL.md`) because it is an operating procedure — how one studio
+works — rather than technique. The tools in `tools/` and the fixtures in
+`reference-exports/` stay public: this bridge is built on someone else's MIT-licensed
+work, and the technique goes back.
