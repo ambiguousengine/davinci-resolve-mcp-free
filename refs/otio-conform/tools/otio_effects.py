@@ -47,7 +47,7 @@ def dump(path, show_all=False):
                 live = params if show_all else [p for p in params if not is_default(p)]
                 if not live:
                     continue
-                print("    EFFECT %r (Type %s)" % (ename, em.get("Effect Type")))
+                print("    EFFECT %r (Type %s)" % (ename, em.get("Type")))
                 for p in live:
                     kf = p.get("Key Frames") or {}
                     line = "      %-28s = %s" % (p.get("Parameter ID"),
