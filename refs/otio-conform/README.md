@@ -143,3 +143,60 @@ any incoming AAF's levels.
 Import with the **defaults** — `import_timeline_from_file(path, {"timelineName": ...})`.
 Setting `importSourceClips: false` is the intuitive choice for a round-trip and it is
 exactly what produces a **Media Offline** timeline.
+
+---
+
+## 25 Jul (second session) — colour, pitch, EQ
+
+### The trap that cost the most: `Default Parameter Value` is load-bearing
+
+**Resolve compares `Parameter Value` against the `Default Parameter Value` you declare, and
+discards the parameter when they are equal** — it reads as "already at default, nothing to
+apply." Declare a wrong default and you silently cancel your own edit; it can take the whole
+effect down with it, `Enabled` flag included.
+
+**Always copy `Default Parameter Value` verbatim from the base export. Never invent it, and
+never set it equal to the value you are writing.** This produced a convincing but false
+"EQ needs a UI click" conclusion for an hour. It does not — `Enabled: true` is honoured on
+import, and everything here was authored from a file with **zero UI involvement**.
+
+### New worked mutations
+
+| file | mutation | verified by |
+|---|---|---|
+| `mut_pitch12.otio` | `semiTones: 12` (one octave up) | every 1/3-octave band reappears at **2f within 0.66 dB**; mean error 0.36 dB vs 6.08 dB for the null |
+| `mut_eq1k_v2.otio` | EQ band 2 → 1000 Hz, +24.0 dB, Q 0.75 (master enabled via UI) | **+23.08 dB peak at exactly 1000 Hz**, symmetric bell, flat at the extremes |
+| `mut_eq1k_no_ui.otio` | **the same, authored from a clean base with NO UI at all** | identical render to the UI version — **0.01 dB across 11 bands** |
+| `mut_eq_enable_only.otio` | isolates the `Enabled` flag — nothing else changed | proves `Enabled: true` **is** honoured on import |
+
+### New reference exports
+
+| file | what it shows |
+|---|---|
+| `ref10_clean_audio_base.otio` | a clean single-clip base built from scratch. **Read effect defaults from here** — this is the file to copy `Default Parameter Value` out of |
+| `ref11_eq_roundtripped.otio` | EQ surviving a round trip with all three band parameters intact |
+| `colour/redoffset_33pt.cube` | a grade exported as a LUT. First entry is literally `0.2 0 0` — the red offset applied to black |
+| `colour/redgrade.drx` | the same grade as `.drx`. **`.drx` round-trips byte-identical; the LUT carries 0.01 chroma mean error** — transfer grades in Resolve as `.drx`, reserve LUTs for crossing apps |
+
+### New tools
+
+| file | what it does |
+|---|---|
+| `otio_slots.py` | lists every effect slot per clip with its `Enabled` state and parameter count. **Run this first** — a disabled slot looks exactly like an unsupported one |
+| `otio_peek_effect.py` | dumps the raw JSON of a named effect, for copying an authoring shape verbatim |
+| `measure_pitch.py` | tests a pitch shift against the null by comparing band `f` to band `2f`. Also the cautionary tale: spectral **centroid** gave 1.0133 where 2.0 was predicted and would have reported a false negative |
+| `measure_eq.py` | per-band energy vs a matched control, with an ASCII plot of the curve |
+| `compare_frames.py` | pixel comparison with a built-in non-degeneracy check (chroma spread, % of pixels where `R==G==B`) |
+
+### Colour is a live-API lane, and it works
+
+`set_cdl` · `get_node_graph` · `reset_all_grades` · `export_lut` / `set_lut` / `get_lut` ·
+`grab_still` + `export_stills(drx)` / `apply_grade_from_drx` · `copy_grades` — all verified by
+pixel. `.drx`, `copy_grades` and `reset_all_grades` are **byte-identical**.
+
+⚠️ **This says nothing about the interchange lane, which still destroys grades.** Grade
+*after* the conform, or move grades by `.drx` independently of the timeline round trip.
+
+⚠️ **`set_lut` refuses an arbitrary absolute path.** Copy the `.cube` into Resolve's
+`Support\LUT` folder → `refresh_lut_list()` → pass the **bare filename**.
+⚠️ **`export_current_frame` fails on the Deliver page** — open **Color** first.
