@@ -14,6 +14,9 @@ Captured from project `FCPXML test` (Resolve Studio 21.0.2.4, bridge 2.1.0),
 | `ref2.otio` | **transition shape** — `Transition.1`, `SMPTE_Dissolve`, `in_offset`+`out_offset` |
 | `ref3_clipvol.otio` | **clip volume shape** — `Fairlight Clip Volume and Fades` → `Parameter ID: "volume"`, dB, range −100..+30 |
 | `torture_ref.otio` | **the title blocker** — Fusion title as `Clip.2` with `MissingReference.1` |
+| `ref4_retime_50pct.otio` | **retime shape** — `LinearTimeWarp.1` / `time_scalar`, a **standard OTIO schema outside the `Resolve_OTIO` block**. Note `Retime and Scaling` (Type 22) stays `"Parameters": []` even here |
+| `ref5_speedramp_stepped.otio` | **speed ramp** — `TimeEffect.1`, keyframes of `[timeline_s, source_s, smooth?, in_x, in_y, out_x, out_y]` |
+| `ref6_speedramp_eased.otio` | **eased ramp** — the same, with cubic Bezier tangent handles populated. Slope `dy/dx` is the instantaneous speed |
 
 ## worked-mutations/ — authored by hand, all verified applied
 
@@ -24,6 +27,14 @@ Captured from project `FCPXML test` (Resolve Studio 21.0.2.4, bridge 2.1.0),
 | `mut_dissolve20.otio` | dissolve 100 → 20 frames | Resolve reports duration 20; re-export `in=10 out=10` |
 | `torture_placeholder.otio` | title → real-media placeholder | import succeeds where the original hard-fails |
 | `torture_full_flow.otio` | placeholder + authored 50 f video fade | title pixel-identical AND fade applied (ratio 0.4842 vs 0.5 predicted) |
+| `mut_retime25.otio` | speed 100% → 25%, added from scratch | frame at 20 s **byte-identical** (same MD5) to the unretimed timeline at 5 s, with a control proving the three comparison frames differ from each other |
+| `mut_speedramp.otio` | 100% / 25% / 100% ramp, added from scratch | all three segments land byte-identical at their predicted source times |
+| `mut_speedramp_eased.otio` | hand-edited Bezier tangents on an eased ramp | cubic Bezier predicts source 2.438 s at timeline 18 s; **measured 2.4 s**, next-nearest sample 15× worse |
+
+**⚠️ Tangent handles are ignored on the first and last keyframes** — ease shaping only
+takes on interior ones. A 2-keyframe ramp with handles on both endpoints renders
+exactly linear (`mean|diff| = 0.000` vs the unretimed reference). Add an interior
+keyframe if a ramp must ease at its very start or end.
 
 ## reference-exports/aaf/ — Resolve's own AAF export (added 25 Jul)
 
@@ -44,14 +55,21 @@ against the matched control — **+10.0 / −5.0 / +10.0 dB, 3/3 windows exact**
 | `otio_effects.py` | prints every **non-default** effect parameter per clip. Effects live at `clip["effects"][n]["metadata"]["Resolve_OTIO"]` — **not** on the clip's own metadata block, which is the easy place to look and find nothing |
 | `bridge.py` | 20-line HTTP client for the bridge. Use it rather than curl: Windows paths do not survive JSON quoting through a shell, and the MCP wrapper's argument names drift from the HTTP routes (`file_name` vs `fileName`) |
 
-## The other thing to remember
+## The other two things to remember
 
 **Resolve only serialises a parameter once it has been moved off its default in the
-UI.** `Fairlight Clip Pan` (72), `Pitch` (67), `Equaliser` (64) and `Retime and
-Scaling` (22) all export as `"Parameters": []` on a clean clip — present, `Enabled`,
-and unauthorable. `GetProperty()` on an audio item returns `{}`, so the live API is no
-help either. Every new verb therefore costs exactly one UI gesture: set it once,
-export, read the ID, author freely from then on.
+UI.** `Fairlight Clip Pan` (72), `Pitch` (67) and `Equaliser` (64) all export as
+`"Parameters": []` on a clean clip — present, `Enabled`, and unauthorable.
+`GetProperty()` on an audio item returns `{}`, so the live API is no help either.
+Every new verb therefore costs exactly one UI gesture: set it once, export, read the
+ID, author freely from then on.
+
+**But an empty `Resolve_OTIO` slot does not mean the feature is absent.** Retime is
+the counter-example: `Retime and Scaling` (Type 22) reports `"Parameters": []` on a
+clip that is demonstrably retimed, because the speed lives in a standard
+`LinearTimeWarp.1` effect outside the Resolve metadata block. Reading only the
+`Resolve_OTIO` block is what produced the wrong "retime is UI-only" call. **Dump the
+clip's whole JSON before declaring anything unauthorable.**
 
 ## Other files
 
