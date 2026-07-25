@@ -2144,6 +2144,33 @@ def action_add_render_job(body):
     return {"success": True, "jobId": job_id}
 
 
+def _render_range_diagnosis(proj):
+    """Why did StartRendering refuse? Resolve gives no reason, so infer the common one.
+
+    By far the most likely cause: render settings have SelectAllFrames=False, so Resolve
+    renders the timeline's IN/OUT RANGE -- and the timeline has no in/out marks, making the
+    range empty. The job then sticks at 'Ready' forever and can be neither started nor
+    deleted, which poisons the whole queue.
+
+    This bites hard after an OTIO round trip, because **importing a timeline CLEARS its
+    mark in/out**. Cost most of a session on 2026-07-25 before it was pinned down.
+    """
+    try:
+        tl = proj.GetCurrentTimeline()
+        if not tl:
+            return "No current timeline."
+        has_in = tl.GetMarkInOut().get("video", {}).get("in") is not None
+    except Exception:                                        # noqa: BLE001
+        return None
+    if not has_in:
+        return ("The timeline has NO mark in/out. If render settings use "
+                "SelectAllFrames=False, Resolve renders the in/out range -- which is "
+                "empty, so nothing can render and the job will sit at 'Ready' "
+                "un-startable and un-deletable. Fix: set SelectAllFrames=True, or set "
+                "mark in/out first. NOTE: importing a timeline CLEARS mark in/out.")
+    return None
+
+
 def action_start_rendering(body):
     _, proj, err = _project()
     if err:
@@ -2153,7 +2180,15 @@ def action_start_rendering(body):
         ok = proj.StartRendering(job_ids)
     else:
         ok = proj.StartRendering()
-    return {"success": bool(ok)}
+    if ok:
+        return {"success": True}
+    # Resolve returns a bare False with no reason. Do not leave the caller guessing --
+    # a silent false here previously read as "the render queue is broken".
+    out = {"success": False}
+    hint = _render_range_diagnosis(proj)
+    if hint:
+        out["diagnosis"] = hint
+    return out
 
 
 def action_stop_rendering(body):
