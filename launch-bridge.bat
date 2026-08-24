@@ -1,4 +1,9 @@
 @echo off
+REM --- Kit activity marker: lets Kit's Tools tab light up when you launch this.
+REM     Writes one empty file whose timestamp is the signal. Safe to delete.
+mkdir "F:\AMBIGUITY\TOOLS\_engine\runs" 2>nul
+echo.>"F:\AMBIGUITY\TOOLS\_engine\runs\davinci-bridge.run" 2>nul
+
 setlocal
 title DaVinci Resolve MCP Bridge (127.0.0.1:9876)
 
