@@ -1989,6 +1989,12 @@ def action_timeline_read(body):
         mpi = safe(lambda it=it: it.GetMediaPoolItem())
         d["mediaId"] = safe(lambda: mpi.GetMediaId()) if mpi else None
         d["end"] = int(safe(lambda it=it: it.GetEnd()) or 0)
+        # Source IN point = the head handle. Nothing else in the read surface
+        # reports it, and without it a caller cannot tell how much media sits
+        # either side of a cut --- which a retime has to know before it asks for
+        # frames that are not there. Added here rather than in _describe()
+        # because _describe() also feeds the undo-log snapshots.
+        d["srcIn"] = int(safe(lambda it=it: it.GetLeftOffset()) or 0)
         out.append(d)
     return {"timeline": safe(lambda: tl.GetName()), "trackType": tt,
             "trackIndex": ti, "count": len(out), "clips": out}
